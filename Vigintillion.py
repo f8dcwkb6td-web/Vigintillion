@@ -1212,19 +1212,20 @@ def get_last_closed_m15(now):
 def trading_loop():
     symbols = ["USDJPY"]
     poll_interval = 0.1
-    post_candle_buffer = timedelta(seconds=25)  # 25-second buffer after M15 close
+    post_candle_buffer = timedelta(seconds=40)  # hardened buffer
 
-    logging.info("Starting Undecillion trading loop (count + post-candle buffer)")
+    logging.info("Starting Undecillion trading loop (timestamp + post-candle buffer)")
 
     # --- Startup delay (15 minutes) ---
     SCRIPT_START_TIME = datetime.now()
-    STARTUP_DELAY = timedelta(minutes=15)
+    STARTUP_DELAY = timedelta(minutes=0.1)
 
     startup_aligned = False
 
-    # Initialize memory
+    # --- Initialize timestamp memory ---
+    last_traded_signal_time = {}
     for s in symbols:
-        last_accepted_count[s] = 0
+        last_traded_signal_time[s] = None
 
     while True:
         now = datetime.now()
@@ -1234,7 +1235,7 @@ def trading_loop():
             time.sleep(poll_interval)
             continue
 
-        # --- One-time startup alignment ---
+        # --- One-time startup alignment (RECORD ONLY, NO TRADES) ---
         if not startup_aligned:
             for symbol in symbols:
                 df = fetch_data(symbol)
@@ -1250,22 +1251,23 @@ def trading_loop():
                 df = apply_reclaim_layer(df)
                 df = apply_metacortex(df)
 
-                accepted_signals = df[df.get("signal_accepted", False)]
-                last_accepted_count[symbol] = len(accepted_signals)
+                accepted = df[df.get("signal_accepted", False)]
+                if not accepted.empty:
+                    last_traded_signal_time[symbol] = accepted["time"].iloc[-1]
 
                 logging.info(
                     f"{symbol} — startup alignment complete, "
-                    f"last_accepted_count set to {last_accepted_count[symbol]}"
+                    f"last_traded_signal_time set to {last_traded_signal_time[symbol]}"
                 )
 
             startup_aligned = True
             time.sleep(poll_interval)
             continue
 
+        # --- Candle-close guard ---
         last_closed_candle = get_last_closed_m15(now)
         time_since_close = now - last_closed_candle
 
-        # Only proceed if within buffer after candle close
         if time_since_close > post_candle_buffer:
             time.sleep(poll_interval)
             continue
@@ -1278,6 +1280,7 @@ def trading_loop():
                 except Exception:
                     sym_info = None
                     logging.exception("mt5.symbol_info error")
+
                 if not sym_info or not getattr(sym_info, "visible", True):
                     continue
                 if not is_valid_session():
@@ -1298,68 +1301,66 @@ def trading_loop():
                 df = apply_metacortex(df)
 
                 df = df.reset_index(drop=True)
-                df["candle_index"] = range(len(df))
                 if "time" not in df.columns:
-                    df["time"] = pd.NaT
+                    continue  # hard fail-safe
 
                 # --- Determine accepted signals ---
-                accepted_signals = df[df.get("signal_accepted", False)].copy()
-                current_count = len(accepted_signals)
+                accepted = df[df.get("signal_accepted", False)]
+                if accepted.empty:
+                    continue
 
-                # --- Only execute if count increased ---
-                if current_count > last_accepted_count[symbol]:
-                    logging.info(
-                        f"{symbol} — accepted signals increased "
-                        f"{last_accepted_count[symbol]} -> {current_count}"
+                latest_sig = accepted.iloc[-1]
+                signal_time = latest_sig["time"]
+                last_time = last_traded_signal_time.get(symbol)
+
+                # --- TIMESTAMP GATE (THE FIX) ---
+                if last_time is not None and signal_time <= last_time:
+                    continue
+
+                # --- Extract trade params ---
+                direction = latest_sig.get("direction")
+                entry = latest_sig.get("entry_price", latest_sig.get("entry"))
+                sl = latest_sig.get("sl")
+                tp = latest_sig.get("tp")
+                pattern_id = latest_sig.get("pattern_id", "unknown")
+
+                try:
+                    volume = calculate_volume(
+                        entry_price=entry,
+                        sl_price=sl,
+                        symbol=symbol,
+                        risk_pct=0.2
+                    )
+                except Exception:
+                    volume = 0.01
+
+                executed = False
+                try:
+                    res_obj = place_trade(
+                        symbol,
+                        direction,
+                        entry,
+                        sl,
+                        tp,
+                        volume,
+                        slippage=5,
+                        magic_number=20250708
+                    )
+                    if getattr(res_obj, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+                        executed = True
+                except Exception:
+                    logging.exception(
+                        f"{symbol} — place_trade failed for {pattern_id}"
                     )
 
-                    sig = accepted_signals.iloc[current_count - 1].to_dict()
-
-                    direction = sig.get("direction")
-                    entry = sig.get("entry_price", sig.get("entry", None))
-                    sl = sig.get("sl", None)
-                    tp = sig.get("tp", None)
-                    pattern_id = sig.get("pattern_id", "unknown")
-
-                    try:
-                        volume = calculate_volume(
-                            entry_price=entry,
-                            sl_price=sl,
-                            symbol=symbol,
-                            risk_pct=0.2
-                        )
-                    except Exception:
-                        volume = 0.01
-
-                    executed = False
-                    try:
-                        res_obj = place_trade(
-                            symbol,
-                            direction,
-                            entry,
-                            sl,
-                            tp,
-                            volume,
-                            slippage=50,
-                            magic_number=20250708
-                        )
-                        ret = getattr(res_obj, "retcode", None)
-                        if ret == mt5.TRADE_RETCODE_DONE:
-                            executed = True
-                    except Exception:
-                        logging.exception(
-                            f"{symbol} — place_trade failed for {pattern_id}"
-                        )
-
-                    if executed:
-                        logging.info(
-                            f"{symbol} — 🚀 Trade EXECUTED | {pattern_id} | "
-                            f"{direction.upper()} | entry={entry} "
-                            f"sl={sl} tp={tp} vol={volume}"
-                        )
-
-                    # --- Update last count only if trade executed ---
-                    last_accepted_count[symbol] = current_count
+                # --- Update timestamp ONLY on execution ---
+                if executed:
+                    last_traded_signal_time[symbol] = signal_time
+                    logging.info(
+                        f"{symbol} — 🚀 Trade EXECUTED | {pattern_id} | "
+                        f"{direction.upper()} | time={signal_time} | "
+                        f"entry={entry} sl={sl} tp={tp} vol={volume}"
+                    )
 
             except Exception as e:
                 logging.error(f"{symbol} — poll error: {e}")
@@ -1371,3 +1372,4 @@ def trading_loop():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     trading_loop()
+
