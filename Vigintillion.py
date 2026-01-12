@@ -70,10 +70,15 @@ session_times = {
 }
 
 
-# === INIT MT5 ===
-if not mt5.initialize():
-    raise RuntimeError("MT5 initialization failed")
 
+
+import MetaTrader5 as mt5
+
+# === INIT MT5 with explicit VPS terminal path ===
+terminal_path = r"C:\Program Files\MetaTrader 5\terminal64.exe"  # <-- replace this with your VPS MT5 path
+
+if not mt5.initialize(path=terminal_path):
+    raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
 
 def safe_str(value, fmt="{:.5f}"):
     try:
@@ -848,26 +853,8 @@ import logging
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-def fetch_data(symbol):
-    # Fetch 4000 M15 candles
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 500)
-    if rates is None or len(rates) == 0:
-        logging.error(f"Failed to fetch rates for symbol {symbol}")
-        return None
 
-    df = pd.DataFrame(rates)
-    df.rename(columns={"tick_volume": "volume"}, inplace=True)
 
-    # Convert to Jamaica time
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)  # parse as UTC
-    df["time"] = df["time"].dt.tz_convert("America/Jamaica")     # convert to Jamaica time
-
-    # Print last 10 candles
-    print(df.tail(10))
-
-    # Save full data to CSV
-    df.to_csv(f"{symbol.lower()}_5m_data.csv", index=False)
-    return df
 
 def safe_str(val, fmt=None):
     if val is None:
@@ -1023,6 +1010,26 @@ def check_signal_outcome(df, sig):
     return sig
 
 
+def fetch_data(symbol):
+    # Fetch 4000 M15 candles
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 4000)
+    if rates is None or len(rates) == 0:
+        logging.error(f"Failed to fetch rates for symbol {symbol}")
+        return None
+
+    df = pd.DataFrame(rates)
+    df.rename(columns={"tick_volume": "volume"}, inplace=True)
+
+    # Convert to Jamaica time
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)  # parse as UTC
+    df["time"] = df["time"].dt.tz_convert("America/Jamaica")     # convert to Jamaica time
+
+    # Print last 10 candles
+    print(df.tail(10))
+
+    # Save full data to CSV
+    df.to_csv(f"{symbol.lower()}_5m_data.csv", index=False)
+    return df
 
 def update_win_rate():
     total_signals = len(processed_signals)
@@ -1207,13 +1214,12 @@ def get_last_closed_m15(now):
     if now.minute % 15 == 0 and now.second == 0:
         last_closed -= timedelta(minutes=15)
     return last_closed
-
 def trading_loop():
     symbols = ["USDJPY"]
     poll_interval = 0.1
     post_candle_buffer = timedelta(seconds=25)  # 25-second buffer after M15 close
 
-    logging.info("Starting Undecillion trading loop (timestamp-based)")
+    logging.info("Starting Undecillion trading loop (timestamp-based + dummy test)")
 
     # --- Startup delay ---
     SCRIPT_START_TIME = datetime.now()
@@ -1222,6 +1228,7 @@ def trading_loop():
 
     # Initialize memory
     last_traded_signal_time = {s: None for s in symbols}
+    dummy_triggered = {s: False for s in symbols}  # Track if dummy signal has been sent
 
     while True:
         now = datetime.now()
@@ -1301,67 +1308,61 @@ def trading_loop():
 
                 # --- Determine accepted signals ---
                 accepted_signals = df[df.get("signal_accepted", False)].copy()
-                if accepted_signals.empty:
-                    continue
+                if not accepted_signals.empty:
+                    latest_sig = accepted_signals.iloc[-1]
+                    signal_time = latest_sig["time"]
+                    last_time = last_traded_signal_time.get(symbol)
 
-                latest_sig = accepted_signals.iloc[-1]
-                signal_time = latest_sig["time"]
-                last_time = last_traded_signal_time.get(symbol)
+                    if last_time is None or signal_time > last_time:
+                        # Consume real signal
+                        last_traded_signal_time[symbol] = signal_time
+                        logging.info(f"{symbol} — SIGNAL ATTEMPTED | time={signal_time}")
 
-                # --- Only proceed if this signal is newer than last tracked ---
-                if last_time is not None and signal_time <= last_time:
-                    continue
+                        direction = latest_sig.get("direction")
+                        entry = latest_sig.get("entry_price", latest_sig.get("entry", None))
+                        sl = latest_sig.get("sl", None)
+                        tp = latest_sig.get("tp", None)
+                        pattern_id = latest_sig.get("pattern_id", "unknown")
 
-                # --- Consume signal (update timestamp immediately) ---
-                last_traded_signal_time[symbol] = signal_time
-                logging.info(f"{symbol} — SIGNAL ATTEMPTED | time={signal_time}")
+                        try:
+                            volume = calculate_volume(entry_price=entry, sl_price=sl, symbol=symbol, risk_pct=0.2)
+                        except Exception:
+                            volume = 0.01
 
-                direction = latest_sig.get("direction")
-                entry = latest_sig.get("entry_price", latest_sig.get("entry", None))
-                sl = latest_sig.get("sl", None)
-                tp = latest_sig.get("tp", None)
-                pattern_id = latest_sig.get("pattern_id", "unknown")
+                        executed = False
+                        try:
+                            res_obj = place_trade(symbol, direction, entry, sl, tp, volume, slippage=50, magic_number=20250708)
+                            if getattr(res_obj, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+                                executed = True
+                        except Exception:
+                            logging.exception(f"{symbol} — place_trade failed for {pattern_id}")
 
-                try:
-                    volume = calculate_volume(
-                        entry_price=entry,
-                        sl_price=sl,
-                        symbol=symbol,
-                        risk_pct=0.2
-                    )
-                except Exception:
-                    volume = 0.01
+                        if executed:
+                            logging.info(f"{symbol} — 🚀 Trade EXECUTED | {pattern_id} | {direction.upper()} | entry={entry} sl={sl} tp={tp} vol={volume}")
+                        else:
+                            logging.warning(f"{symbol} — ⚠️ Trade ATTEMPTED BUT NOT EXECUTED | {pattern_id} | time={signal_time}")
 
-                executed = False
-                try:
-                    res_obj = place_trade(
-                        symbol,
-                        direction,
-                        entry,
-                        sl,
-                        tp,
-                        volume,
-                        slippage=50,
-                        magic_number=20250708
-                    )
-                    ret = getattr(res_obj, "retcode", None)
-                    if ret == mt5.TRADE_RETCODE_DONE:
-                        executed = True
-                except Exception:
-                    logging.exception(
-                        f"{symbol} — place_trade failed for {pattern_id}"
-                    )
+                # --- DUMMY SIGNAL TEST (only once) ---
+                if not dummy_triggered[symbol]:
+                    logging.info(f"{symbol} — Sending DUMMY SIGNAL for test")
+                    dummy_time = datetime.utcnow()
+                    dummy_direction = "buy"
+                    dummy_entry = mt5.symbol_info_tick(symbol).ask
+                    dummy_sl = dummy_entry - 0.01
+                    dummy_tp = dummy_entry + 0.02
+                    dummy_volume = 0.01
+                    dummy_pattern_id = "DUMMY_TEST"
 
-                if executed:
-                    logging.info(
-                        f"{symbol} — 🚀 Trade EXECUTED | {pattern_id} | "
-                        f"{direction.upper()} | entry={entry} "
-                        f"sl={sl} tp={tp} vol={volume}"
-                    )
-                else:
-                    logging.warning(
-                        f"{symbol} — ⚠️ Trade ATTEMPTED BUT NOT EXECUTED | {pattern_id} | time={signal_time}"
-                    )
+                    try:
+                        res_obj = place_trade(symbol, dummy_direction, dummy_entry, dummy_sl, dummy_tp, dummy_volume, slippage=50, magic_number=20250708)
+                        if getattr(res_obj, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+                            logging.info(f"{symbol} — 🚀 DUMMY TRADE EXECUTED | {dummy_pattern_id}")
+                        else:
+                            logging.warning(f"{symbol} — ⚠️ DUMMY TRADE NOT EXECUTED | {dummy_pattern_id}")
+                    except Exception:
+                        logging.exception(f"{symbol} — DUMMY trade failed")
+
+                    dummy_triggered[symbol] = True  # Only send once
 
             except Exception as e:
                 logging.error(f"{symbol} — poll error: {e}")
@@ -1373,4 +1374,3 @@ def trading_loop():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     trading_loop()
-
