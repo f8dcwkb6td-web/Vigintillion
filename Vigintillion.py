@@ -850,7 +850,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 def fetch_data(symbol):
     # Fetch 4000 M15 candles
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 4000)
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 500)
     if rates is None or len(rates) == 0:
         logging.error(f"Failed to fetch rates for symbol {symbol}")
         return None
@@ -868,7 +868,6 @@ def fetch_data(symbol):
     # Save full data to CSV
     df.to_csv(f"{symbol.lower()}_5m_data.csv", index=False)
     return df
-
 
 def safe_str(val, fmt=None):
     if val is None:
@@ -1212,28 +1211,27 @@ def get_last_closed_m15(now):
 def trading_loop():
     symbols = ["USDJPY"]
     poll_interval = 0.1
-    post_candle_buffer = timedelta(seconds=40)
+    post_candle_buffer = timedelta(seconds=25)  # 25-second buffer after M15 close
 
-    logging.info("Starting Undecillion trading loop (robust signal consumption)")
+    logging.info("Starting Undecillion trading loop (timestamp-based)")
 
     # --- Startup delay ---
     SCRIPT_START_TIME = datetime.now()
     STARTUP_DELAY = timedelta(minutes=0.1)
-
     startup_aligned = False
 
-    # --- Signal consumption memory ---
+    # Initialize memory
     last_traded_signal_time = {s: None for s in symbols}
 
     while True:
         now = datetime.now()
 
-        # --- Startup cooldown ---
+        # --- Startup cooldown guard ---
         if now - SCRIPT_START_TIME < STARTUP_DELAY:
             time.sleep(poll_interval)
             continue
 
-        # --- One-time startup alignment (NO TRADING) ---
+        # --- One-time startup alignment ---
         if not startup_aligned:
             for symbol in symbols:
                 df = fetch_data(symbol)
@@ -1249,40 +1247,41 @@ def trading_loop():
                 df = apply_reclaim_layer(df)
                 df = apply_metacortex(df)
 
-                accepted = df[df.get("signal_accepted", False)]
-                if not accepted.empty:
-                    last_traded_signal_time[symbol] = accepted["time"].iloc[-1]
+                accepted_signals = df[df.get("signal_accepted", False)]
+                if not accepted_signals.empty:
+                    last_traded_signal_time[symbol] = accepted_signals["time"].iloc[-1]
 
                 logging.info(
-                    f"{symbol} — startup aligned | "
-                    f"last_traded_signal_time={last_traded_signal_time[symbol]}"
+                    f"{symbol} — startup alignment complete, "
+                    f"last_traded_signal_time set to {last_traded_signal_time[symbol]}"
                 )
 
             startup_aligned = True
             time.sleep(poll_interval)
             continue
 
-        # --- Candle-close guard ---
+        # --- CANDLE CLOSE GUARD ---
         last_closed_candle = get_last_closed_m15(now)
-        if now - last_closed_candle > post_candle_buffer:
+        time_since_close = now - last_closed_candle
+        if time_since_close > post_candle_buffer:
             time.sleep(poll_interval)
             continue
 
+        # --- Main symbol loop ---
         for symbol in symbols:
             try:
-                # --- MT5 checks ---
+                # --- MT5 symbol/session checks ---
                 try:
                     sym_info = mt5.symbol_info(symbol)
                 except Exception:
+                    sym_info = None
                     logging.exception("mt5.symbol_info error")
-                    continue
-
                 if not sym_info or not getattr(sym_info, "visible", True):
                     continue
                 if not is_valid_session():
                     continue
 
-                # --- Fetch & pipeline ---
+                # --- Fetch & run pipeline ---
                 df = fetch_data(symbol)
                 if df is None or df.empty:
                     continue
@@ -1298,32 +1297,29 @@ def trading_loop():
 
                 df = df.reset_index(drop=True)
                 if "time" not in df.columns:
+                    df["time"] = pd.NaT
+
+                # --- Determine accepted signals ---
+                accepted_signals = df[df.get("signal_accepted", False)].copy()
+                if accepted_signals.empty:
                     continue
 
-                # --- Accepted signals ---
-                accepted = df[df.get("signal_accepted", False)]
-                if accepted.empty:
-                    continue
-
-                latest_sig = accepted.iloc[-1]
+                latest_sig = accepted_signals.iloc[-1]
                 signal_time = latest_sig["time"]
                 last_time = last_traded_signal_time.get(symbol)
 
-                # --- HARD TIMESTAMP GATE ---
+                # --- Only proceed if this signal is newer than last tracked ---
                 if last_time is not None and signal_time <= last_time:
                     continue
 
-                # --- CONSUME SIGNAL IMMEDIATELY (CRITICAL FIX) ---
+                # --- Consume signal (update timestamp immediately) ---
                 last_traded_signal_time[symbol] = signal_time
-                logging.info(
-                    f"{symbol} — SIGNAL CONSUMED | time={signal_time}"
-                )
+                logging.info(f"{symbol} — SIGNAL ATTEMPTED | time={signal_time}")
 
-                # --- Extract trade params ---
                 direction = latest_sig.get("direction")
-                entry = latest_sig.get("entry_price", latest_sig.get("entry"))
-                sl = latest_sig.get("sl")
-                tp = latest_sig.get("tp")
+                entry = latest_sig.get("entry_price", latest_sig.get("entry", None))
+                sl = latest_sig.get("sl", None)
+                tp = latest_sig.get("tp", None)
                 pattern_id = latest_sig.get("pattern_id", "unknown")
 
                 try:
@@ -1345,29 +1341,30 @@ def trading_loop():
                         sl,
                         tp,
                         volume,
-                        slippage=5,
+                        slippage=50,
                         magic_number=20250708
                     )
-                    if getattr(res_obj, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+                    ret = getattr(res_obj, "retcode", None)
+                    if ret == mt5.TRADE_RETCODE_DONE:
                         executed = True
                 except Exception:
                     logging.exception(
-                        f"{symbol} — place_trade failed | {pattern_id}"
+                        f"{symbol} — place_trade failed for {pattern_id}"
                     )
 
                 if executed:
                     logging.info(
-                        f"{symbol} — 🚀 EXECUTED | {pattern_id} | "
-                        f"{direction.upper()} | entry={entry} sl={sl} tp={tp} vol={volume}"
+                        f"{symbol} — 🚀 Trade EXECUTED | {pattern_id} | "
+                        f"{direction.upper()} | entry={entry} "
+                        f"sl={sl} tp={tp} vol={volume}"
                     )
                 else:
                     logging.warning(
-                        f"{symbol} — ⚠️ ATTEMPTED BUT NOT EXECUTED | "
-                        f"{pattern_id} | time={signal_time}"
+                        f"{symbol} — ⚠️ Trade ATTEMPTED BUT NOT EXECUTED | {pattern_id} | time={signal_time}"
                     )
 
-            except Exception:
-                logging.error(f"{symbol} — poll error")
+            except Exception as e:
+                logging.error(f"{symbol} — poll error: {e}")
                 logging.error(traceback.format_exc())
 
         time.sleep(poll_interval)
@@ -1376,3 +1373,4 @@ def trading_loop():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     trading_loop()
+
