@@ -105,7 +105,7 @@ def is_valid_session():
 
     sessions = {
 
-        "london": [(1, 10)],           # 3AM–12PM
+        "london": [(24, 10)],           # 3AM–12PM
         "ny": [(8, 24 )],               # 8AM–5PM
     }
 
