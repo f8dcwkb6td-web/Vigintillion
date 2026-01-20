@@ -1230,6 +1230,9 @@ def trading_loop():
     last_traded_signal_time = {s: None for s in symbols}
     dummy_triggered = {s: False for s in symbols}  # Track if dummy signal has been sent
 
+    # --- Outcome tracking ---
+    global processed_signals, last_outcome_check_time
+
     while True:
         now = datetime.now()
 
@@ -1314,7 +1317,6 @@ def trading_loop():
                     last_time = last_traded_signal_time.get(symbol)
 
                     if last_time is None or signal_time > last_time:
-                        # Consume real signal
                         last_traded_signal_time[symbol] = signal_time
                         logging.info(f"{symbol} — SIGNAL ATTEMPTED | time={signal_time}")
 
@@ -1338,14 +1340,29 @@ def trading_loop():
                             logging.exception(f"{symbol} — place_trade failed for {pattern_id}")
 
                         if executed:
-                            logging.info(f"{symbol} — 🚀 Trade EXECUTED | {pattern_id} | {direction.upper()} | entry={entry} sl={sl} tp={tp} vol={volume}")
+                            logging.info(
+                                f"{symbol} — 🚀 Trade EXECUTED | {pattern_id} | "
+                                f"{direction.upper()} | entry={entry} sl={sl} tp={tp} vol={volume}"
+                            )
+
+                            processed_signals.append({
+                                "time": signal_time,
+                                "direction": direction,
+                                "entry": entry,
+                                "sl": sl,
+                                "tp": tp,
+                                "pattern_id": pattern_id,
+                                "outcome": None
+                            })
                         else:
-                            logging.warning(f"{symbol} — ⚠️ Trade ATTEMPTED BUT NOT EXECUTED | {pattern_id} | time={signal_time}")
+                            logging.warning(
+                                f"{symbol} — ⚠️ Trade ATTEMPTED BUT NOT EXECUTED | "
+                                f"{pattern_id} | time={signal_time}"
+                            )
 
                 # --- DUMMY SIGNAL TEST (only once) ---
                 if not dummy_triggered[symbol]:
                     logging.info(f"{symbol} — Sending DUMMY SIGNAL for test")
-                    dummy_time = datetime.utcnow()
                     dummy_direction = "buy"
                     dummy_entry = mt5.symbol_info_tick(symbol).ask
                     dummy_sl = dummy_entry - 0.01
@@ -1354,7 +1371,11 @@ def trading_loop():
                     dummy_pattern_id = "DUMMY_TEST"
 
                     try:
-                        res_obj = place_trade(symbol, dummy_direction, dummy_entry, dummy_sl, dummy_tp, dummy_volume, slippage=50, magic_number=20250708)
+                        res_obj = place_trade(
+                            symbol, dummy_direction, dummy_entry,
+                            dummy_sl, dummy_tp, dummy_volume,
+                            slippage=50, magic_number=20250708
+                        )
                         if getattr(res_obj, "retcode", None) == mt5.TRADE_RETCODE_DONE:
                             logging.info(f"{symbol} — 🚀 DUMMY TRADE EXECUTED | {dummy_pattern_id}")
                         else:
@@ -1362,7 +1383,34 @@ def trading_loop():
                     except Exception:
                         logging.exception(f"{symbol} — DUMMY trade failed")
 
-                    dummy_triggered[symbol] = True  # Only send once
+                    dummy_triggered[symbol] = True
+
+                # --- OUTCOME CHECK + WIN RATE PRINT ---
+                try:
+                    if symbol not in last_outcome_check_time:
+                        last_outcome_check_time[symbol] = datetime.min
+
+                    df_outcome = fetch_data(symbol)
+                    if df_outcome is not None and not df_outcome.empty:
+                        for sig in processed_signals:
+                            if sig.get("outcome") in ("win", "loss"):
+                                continue
+
+                            sig_time = pd.to_datetime(sig.get("time"))
+                            if sig_time <= last_outcome_check_time[symbol]:
+                                continue
+
+                            sig = check_signal_outcome(df_outcome, sig)
+
+                            if sig.get("outcome") in ("win", "loss"):
+                                sig["resolved_time"] = df_outcome.iloc[-1]["time"]
+                                log_trade_outcome(sig)
+                                update_win_rate()
+
+                        last_outcome_check_time[symbol] = df_outcome.iloc[-1]["time"]
+
+                except Exception:
+                    logging.exception(f"{symbol} — outcome analysis failure")
 
             except Exception as e:
                 logging.error(f"{symbol} — poll error: {e}")
