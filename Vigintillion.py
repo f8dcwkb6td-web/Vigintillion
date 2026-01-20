@@ -1330,7 +1330,7 @@ def trading_loop():
                                 entry_price=entry,
                                 sl_price=sl,
                                 symbol=symbol,
-                                risk_pct=0.2
+                                risk_pct=0.1
                             )
                         except Exception:
                             volume = 0.01
