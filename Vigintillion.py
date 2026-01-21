@@ -105,7 +105,7 @@ def is_valid_session():
 
     sessions = {
 
-        "london": [(24, 10)],           # 3AM–12PM
+        "london": [(1, 10)],           # 3AM–12PM
         "ny": [(8, 24 )],               # 8AM–5PM
     }
 
@@ -287,15 +287,15 @@ if __name__ == "__main__":
         # -----------------------
         # HP-LR Buy Looser (vectorized)
         # -----------------------
-        LOOKBACK = 5
-        WICK_RATIO = .9
-        MIN_BODY = 0.15
-        VOL_MULT = 1.25
-        MIN_VOL = 400
-        CONFIRM_BODY_ATR = 0.15
-        SL_ATR_PAD = 0.25
-        TP_ATR = 2.2
-        LOOKBACK_VOL = 10
+        LOOKBACK = 10
+        WICK_RATIO = .4
+        MIN_BODY = 0.25
+        VOL_MULT = 1.35
+        MIN_VOL = 1200
+        CONFIRM_BODY_ATR = 0.4
+        SL_ATR_PAD = 0.26
+        TP_ATR = 2.8
+        LOOKBACK_VOL = 20
 
         valid_idx_series = pd.Series(np.arange(n) >= LOOKBACK, index=df.index)
 
@@ -337,76 +337,14 @@ if __name__ == "__main__":
             pre_signal_bias.loc[idxs] = "buy"
             pattern_id.loc[idxs] = "HP-LR_Buy_(Looser_Version)"
 
-        # -----------------------
-        # Winning Thrust Sell Ultra-Loose (vectorized)
-        # -----------------------
-        lookback = 3
-        sl_scale = 0.5
-        tp_scale = 1.0
-        min_vol = 500
-
-        # shifted candles
-        c1_close = df['close'].shift(3)
-        c1_open = df['open'].shift(3)
-        c1_high = df['high'].shift(3)
-        c1_low = df['low'].shift(3)
-
-        c2_close = df['close'].shift(2)
-        c2_open = df['open'].shift(2)
-
-        c3_close = df['close'].shift(1)
-        c3_open = df['open'].shift(1)
-        c3_high = df['high'].shift(1)
-
-        c4_close = df['close']
-        c4_open = df['open']
-        c4_high = df['high']
-        c4_vol = df['volume']
-
-        cond_c1 = (c1_close > c1_open) & ((c1_close - c1_open).abs() > 0.6 * (c1_high - c1_low + eps))
-        cond_c2 = (c2_close <= c1_close) & ((c2_close - c2_open).abs() < 0.3 * (c1_close - c1_open).abs())
-        cond_c3 = (c3_close > c3_open) & (c3_close > c2_close) & (
-                    (c3_high - np.maximum(c3_close, c3_open)) < 0.2 * (c3_close - c3_open).abs())
-        cond_c4 = (c4_close > c4_open) & (c4_close > c3_close) & (
-                    (c4_high - np.maximum(c4_close, c4_open)) < 0.2 * (c4_close - c4_open).abs())
-        cond_vol_ok = c4_vol >= min_vol
-
-        thrust_valid = cond_c1 & cond_c2 & cond_c3 & cond_c4 & cond_vol_ok
-
-        window_len = lookback + 1
-        sig_low_win = df['low'].rolling(window=window_len, min_periods=window_len).min()
-        sig_high_win = df['high'].rolling(window=window_len, min_periods=window_len).max()
-
-        thrust_mask = (thrust_valid & next_open_valid).fillna(False)
-
-        if thrust_mask.any():
-            idxs = thrust_mask[thrust_mask].index
-            entry_vals = next_open.loc[idxs].astype(float)
-            sig_low_vals = sig_low_win.loc[idxs].astype(float)
-            sig_high_vals = sig_high_win.loc[idxs].astype(float)
-            signal_range_vals = (sig_high_vals - sig_low_vals)
-
-            sl_vals = (sig_high_vals + sl_scale * signal_range_vals).round(3)
-            tp_vals = (entry_vals - tp_scale * signal_range_vals).round(3)
-
-            # Overwrite earlier assignments where thrust_mask true
-            signal_flag.loc[idxs] = 1
-            direction.loc[idxs] = "sell"
-            entry_price.loc[idxs] = entry_vals
-            sl.loc[idxs] = sl_vals
-            tp.loc[idxs] = tp_vals
-            signal_reason.loc[idxs] = "Winning Thrust Sell Ultra-Loose"
-            pattern_build_score.loc[idxs] = 1.0
-            pre_signal_bias.loc[idxs] = "sell"
-            pattern_id.loc[idxs] = "Winning_Thrust_Sell_Ultra-Loose"
 
         # -----------------------
         # MSB Sell (Market Structure Break) - Tunable SL/TP (vectorized)
         # -----------------------
-        LOOKBACK = 4
-        CONFIRM_BODY_ATR = 0.2
-        SL_MULT = 1.4
-        TP_MULT = 1.6
+        LOOKBACK = 8
+        CONFIRM_BODY_ATR = 0.3
+        SL_MULT = 1.7
+        TP_MULT = 1.7
 
         recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
         cond_msb_base = (df['close'] < recent_low) & (df['close'] < df['open'])
@@ -867,7 +805,7 @@ def safe_str(val, fmt=None):
     return str(val)
 
 
-def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.1):
+def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.2):
     account_info = mt5.account_info()
     symbol_info = mt5.symbol_info(symbol)
 
@@ -1011,25 +949,74 @@ def check_signal_outcome(df, sig):
 
 
 def fetch_data(symbol):
-    # Fetch 4000 M15 candles
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 4000)
-    if rates is None or len(rates) == 0:
-        logging.error(f"Failed to fetch rates for symbol {symbol}")
-        return None
+    """
+    Fetch M15 candles with robust incremental update:
+    - First call: fetch 128,000 candles
+    - Subsequent calls: fill any missing candles and append the latest
+    """
+    import pandas as pd
+    import logging
+    import MetaTrader5 as mt5
+    from datetime import timedelta
 
-    df = pd.DataFrame(rates)
-    df.rename(columns={"tick_volume": "volume"}, inplace=True)
+    # --- Initialize memory storage ---
+    if not hasattr(fetch_data, "_cache"):
+        fetch_data._cache = {}
+    if symbol not in fetch_data._cache:
+        fetch_data._cache[symbol] = pd.DataFrame()
 
-    # Convert to Jamaica time
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)  # parse as UTC
-    df["time"] = df["time"].dt.tz_convert("America/Jamaica")     # convert to Jamaica time
+    cached_df = fetch_data._cache[symbol]
 
-    # Print last 10 candles
-    print(df.tail(10))
+    # --- First fetch (full history) ---
+    if cached_df.empty:
+        logging.info(f"{symbol} — Fetching initial 8,000 candles")
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 8000)
+        if rates is None or len(rates) == 0:
+            logging.error(f"{symbol} — Failed to fetch initial rates")
+            return None
 
-    # Save full data to CSV
-    df.to_csv(f"{symbol.lower()}_5m_data.csv", index=False)
-    return df
+        df = pd.DataFrame(rates)
+        df.rename(columns={"tick_volume": "volume"}, inplace=True)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        df["time"] = df["time"].dt.tz_convert("America/Jamaica")
+
+        fetch_data._cache[symbol] = df
+        cached_df = df.copy()
+
+    else:
+        # --- Incremental fetch with gap-fill ---
+        last_time = cached_df["time"].max()
+        next_expected_time = last_time + timedelta(minutes=15)
+
+        now = pd.Timestamp.now(tz="America/Jamaica")
+        # Compute how many M15 candles are missing (failsafe)
+        missing_candles = int((now - next_expected_time) / timedelta(minutes=15))
+        if missing_candles < 1:
+            missing_candles = 1  # always fetch at least the latest
+
+        logging.info(f"{symbol} — Fetching {missing_candles} candle(s) after {last_time}")
+
+        rates = mt5.copy_rates_from(symbol, mt5.TIMEFRAME_M15, next_expected_time.to_pydatetime(), missing_candles)
+        if rates is not None and len(rates) > 0:
+            df_new = pd.DataFrame(rates)
+            df_new.rename(columns={"tick_volume": "volume"}, inplace=True)
+            df_new["time"] = pd.to_datetime(df_new["time"], unit="s", utc=True)
+            df_new["time"] = df_new["time"].dt.tz_convert("America/Jamaica")
+
+            # Remove duplicates if overlapping
+            df_new = df_new[~df_new["time"].isin(cached_df["time"])]
+
+            if not df_new.empty:
+                fetch_data._cache[symbol] = pd.concat([cached_df, df_new], ignore_index=True)
+                cached_df = fetch_data._cache[symbol]
+
+    # --- Print last 10 candles ---
+    print(cached_df.tail(10))
+
+    # --- Save to CSV ---
+    cached_df.to_csv(f"{symbol.lower()}_5m_data.csv", index=False)
+
+    return cached_df
 
 def update_win_rate():
     total_signals = len(processed_signals)
@@ -1214,31 +1201,40 @@ def get_last_closed_m15(now):
     if now.minute % 15 == 0 and now.second == 0:
         last_closed -= timedelta(minutes=15)
     return last_closed
+def print_win_loss_sequence(processed_signals, last_n=5000):
+    seq = [s["outcome"] for s in processed_signals if s.get("outcome") in ("win", "loss")]
+    if not seq:
+        logging.info("Win/Loss sequence: N/A")
+        return
+    tail = seq[-last_n:]
+    logging.info(f"Win/Loss sequence (last {len(tail)}): {' '.join(tail)}")
 def trading_loop():
     symbols = ["USDJPY"]
     poll_interval = 0.1
-    post_candle_buffer = timedelta(seconds=25)  # 25-second buffer after M15 close
+    post_candle_buffer = timedelta(seconds=25)
 
-    logging.info("Starting Undecillion trading loop (timestamp-based + dummy test)")
+    logging.info("Starting Undecillion trading loop (timestamp-based + analytics)")
 
-    # --- Startup delay ---
     SCRIPT_START_TIME = datetime.now()
     STARTUP_DELAY = timedelta(minutes=0.1)
     startup_aligned = False
 
-    # Initialize memory
     last_traded_signal_time = {s: None for s in symbols}
-    dummy_triggered = {s: False for s in symbols}  # Track if dummy signal has been sent
+
+    # --- GLOBAL ANALYTICS MEMORY ---
+    global processed_signals
+    processed_signals = []
 
     while True:
         now = datetime.now()
 
-        # --- Startup cooldown guard ---
         if now - SCRIPT_START_TIME < STARTUP_DELAY:
             time.sleep(poll_interval)
             continue
 
-        # --- One-time startup alignment ---
+        # =========================
+        # STARTUP ALIGNMENT (ONCE)
+        # =========================
         if not startup_aligned:
             for symbol in symbols:
                 df = fetch_data(symbol)
@@ -1254,9 +1250,53 @@ def trading_loop():
                 df = apply_reclaim_layer(df)
                 df = apply_metacortex(df)
 
-                accepted_signals = df[df.get("signal_accepted", False)]
-                if not accepted_signals.empty:
-                    last_traded_signal_time[symbol] = accepted_signals["time"].iloc[-1]
+                df = df.reset_index(drop=True)
+
+                accepted = df[df.get("signal_accepted", False)]
+
+                # --- BACKFILL SIGNALS FOR ANALYTICS ---
+                for _, row in accepted.iterrows():
+                    processed_signals.append({
+                        "time": row["time"],
+                        "candle_index": row.name,
+                        "entry": row.get("entry_price", row.get("entry")),
+                        "sl": row.get("sl"),
+                        "tp": row.get("tp"),
+                        "direction": row.get("direction"),
+                        "pattern_id": row.get("pattern_id", "unknown"),
+                        "outcome": None
+                    })
+
+                if not accepted.empty:
+                    last_traded_signal_time[symbol] = accepted["time"].iloc[-1]
+
+                # --- EVALUATE HISTORICAL OUTCOMES ---
+                for sig in processed_signals:
+                    check_signal_outcome(df, sig)
+
+                # --- BASIC PERFORMANCE PRINT ---
+                update_win_rate()
+                print_win_loss_sequence(processed_signals)
+
+                # =========================
+                # 🔬 LOSING TRADE ANALYSIS
+                # =========================
+                if processed_signals:
+                    signals_df = pd.DataFrame(processed_signals)
+
+                    logging.info("===== LOSING TRADE ATTRIBUTE ANALYSIS =====")
+                    best_combo, filtered_df = analyze_losing_trade_attributes(
+                        df=df,
+                        signals_df=signals_df,
+                        min_trades=20
+                    )
+
+                    if best_combo:
+                        logging.info(
+                            f"Best filter combo identified: {best_combo} "
+                            f"| Remaining trades: {len(filtered_df)}"
+                        )
+                    logging.info("===== END ANALYSIS =====")
 
                 logging.info(
                     f"{symbol} — startup alignment complete, "
@@ -1267,29 +1307,25 @@ def trading_loop():
             time.sleep(poll_interval)
             continue
 
-        # --- CANDLE CLOSE GUARD ---
-        last_closed_candle = get_last_closed_m15(now)
-        time_since_close = now - last_closed_candle
-        if time_since_close > post_candle_buffer:
+        # =========================
+        # CANDLE CLOSE GUARD
+        # =========================
+        last_closed = get_last_closed_m15(now)
+        if now - last_closed > post_candle_buffer:
             time.sleep(poll_interval)
             continue
 
-        # --- Main symbol loop ---
+        # =========================
+        # LIVE LOOP
+        # =========================
         for symbol in symbols:
             try:
-                # --- MT5 symbol/session checks ---
-                try:
-                    sym_info = mt5.symbol_info(symbol)
-                except Exception:
-                    sym_info = None
-                    logging.exception("mt5.symbol_info error")
-
-                if not sym_info or not getattr(sym_info, "visible", True):
+                info = mt5.symbol_info(symbol)
+                if not info or not getattr(info, "visible", True):
                     continue
                 if not is_valid_session():
                     continue
 
-                # --- Fetch & run pipeline ---
                 df = fetch_data(symbol)
                 if df is None or df.empty:
                     continue
@@ -1304,100 +1340,51 @@ def trading_loop():
                 df = apply_metacortex(df)
 
                 df = df.reset_index(drop=True)
-                if "time" not in df.columns:
-                    df["time"] = pd.NaT
 
-                # --- Determine accepted signals ---
-                accepted_signals = df[df.get("signal_accepted", False)].copy()
-                if not accepted_signals.empty:
-                    latest_sig = accepted_signals.iloc[-1]
-                    signal_time = latest_sig["time"]
-                    last_time = last_traded_signal_time.get(symbol)
+                accepted = df[df.get("signal_accepted", False)]
+                if not accepted.empty:
+                    latest = accepted.iloc[-1]
+                    sig_time = latest["time"]
 
-                    if last_time is None or signal_time > last_time:
-                        # Consume real signal
-                        last_traded_signal_time[symbol] = signal_time
-                        logging.info(f"{symbol} — SIGNAL ATTEMPTED | time={signal_time}")
+                    if last_traded_signal_time[symbol] is None or sig_time > last_traded_signal_time[symbol]:
+                        last_traded_signal_time[symbol] = sig_time
 
-                        direction = latest_sig.get("direction")
-                        entry = latest_sig.get("entry_price", latest_sig.get("entry", None))
-                        sl = latest_sig.get("sl", None)
-                        tp = latest_sig.get("tp", None)
-                        pattern_id = latest_sig.get("pattern_id", "unknown")
+                        entry = latest.get("entry_price", latest.get("entry"))
+                        sl = latest.get("sl")
+                        tp = latest.get("tp")
+                        direction = latest.get("direction")
+                        pattern_id = latest.get("pattern_id", "unknown")
+
+                        processed_signals.append({
+                            "time": sig_time,
+                            "candle_index": latest.name,
+                            "entry": entry,
+                            "sl": sl,
+                            "tp": tp,
+                            "direction": direction,
+                            "pattern_id": pattern_id,
+                            "outcome": None
+                        })
 
                         try:
-                            volume = calculate_volume(
-                                entry_price=entry,
-                                sl_price=sl,
-                                symbol=symbol,
-                                risk_pct=0.1
-                            )
+                            volume = calculate_volume(entry, sl, symbol, risk_pct=0.2)
                         except Exception:
                             volume = 0.01
 
-                        executed = False
                         try:
-                            res_obj = place_trade(
-                                symbol,
-                                direction,
-                                entry,
-                                sl,
-                                tp,
-                                volume,
-                                slippage=50,
-                                magic_number=20250708
+                            place_trade(
+                                symbol, direction, entry, sl, tp,
+                                volume, slippage=50, magic_number=20250708
                             )
-                            if getattr(res_obj, "retcode", None) == mt5.TRADE_RETCODE_DONE:
-                                executed = True
                         except Exception:
-                            logging.exception(f"{symbol} — place_trade failed for {pattern_id}")
+                            logging.exception("Trade execution failed")
 
-                        if executed:
-                            logging.info(
-                                f"{symbol} — 🚀 Trade EXECUTED | {pattern_id} | "
-                                f"{direction.upper()} | entry={entry} sl={sl} tp={tp} vol={volume}"
-                            )
-                        else:
-                            logging.warning(
-                                f"{symbol} — ⚠️ Trade ATTEMPTED BUT NOT EXECUTED | "
-                                f"{pattern_id} | time={signal_time}"
-                            )
+                # --- UPDATE ANALYTICS LIVE ---
+                for sig in processed_signals:
+                    check_signal_outcome(df, sig)
 
-                # --- DUMMY SIGNAL TEST (only once) ---
-                if not dummy_triggered[symbol]:
-                    logging.info(f"{symbol} — Sending DUMMY SIGNAL for test")
-
-                    dummy_time = datetime.utcnow()
-                    dummy_direction = "buy"
-                    dummy_entry = mt5.symbol_info_tick(symbol).ask
-                    dummy_sl = dummy_entry - 0.01
-                    dummy_tp = dummy_entry + 0.02
-                    dummy_volume = 0.01
-                    dummy_pattern_id = "DUMMY_TEST"
-
-                    try:
-                        res_obj = place_trade(
-                            symbol,
-                            dummy_direction,
-                            dummy_entry,
-                            dummy_sl,
-                            dummy_tp,
-                            dummy_volume,
-                            slippage=50,
-                            magic_number=20250708
-                        )
-                        if getattr(res_obj, "retcode", None) == mt5.TRADE_RETCODE_DONE:
-                            logging.info(
-                                f"{symbol} — 🚀 DUMMY TRADE EXECUTED | {dummy_pattern_id}"
-                            )
-                        else:
-                            logging.warning(
-                                f"{symbol} — ⚠️ DUMMY TRADE NOT EXECUTED | {dummy_pattern_id}"
-                            )
-                    except Exception:
-                        logging.exception(f"{symbol} — DUMMY trade failed")
-
-                    dummy_triggered[symbol] = True  # Only send once
+                update_win_rate()
+                print_win_loss_sequence(processed_signals)
 
             except Exception as e:
                 logging.error(f"{symbol} — poll error: {e}")
