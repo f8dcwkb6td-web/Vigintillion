@@ -867,7 +867,7 @@ def safe_str(val, fmt=None):
     return str(val)
 
 
-def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.2):
+def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.1):
     account_info = mt5.account_info()
     symbol_info = mt5.symbol_info(symbol)
 
