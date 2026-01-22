@@ -55,7 +55,8 @@ if account_info is None:
 print(f" Logged into account {account_info.login} | Balance: {account_info.balance} | Margin Free: {account_info.margin_free} | Margin Level: {account_info.margin_level}")
 
 # === CONFIGURATION ===
-symbols = [  "USDJPY"]  # ✅ Mono-symbol mode
+symbols = ["USDJPY"]
+
 
 lot_step = 0.01
 
@@ -370,8 +371,44 @@ if __name__ == "__main__":
             pattern_build_score.loc[idxs] = 1.0
             pre_signal_bias.loc[idxs] = "sell"
             pattern_id.loc[idxs] = "MSB_Sell"
+        # -----------------------
+        # LSR Buy (Liquidity Sweep Reclaim) - High-Confidence Buy
+        # -----------------------
+        LOOKBACK = 15
+        CONFIRM_BODY_ATR = 0.6
+        SL_MULT = 1.9
+        TP_MULT = 2.5
 
-      
+        recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
+
+        # Sweep below prior liquidity
+        cond_sweep = df['low'] < recent_low
+
+        # Reclaim: bullish close back above sweep zone
+        cond_reclaim = (df['close'] > recent_low) & (df['close'] > df['open'])
+
+        # Confirmation candle
+        cond_confirm = next_dir_bull_series & (next_body_series >= (CONFIRM_BODY_ATR * atr_series))
+
+        lsr_buy_mask = (cond_sweep & cond_reclaim & cond_confirm & next_open_valid).fillna(False)
+
+        if lsr_buy_mask.any():
+            idxs = lsr_buy_mask[lsr_buy_mask].index
+            entry_vals = next_open.loc[idxs].astype(float)
+
+            sl_vals = (entry_vals - (SL_MULT * atr_series.loc[idxs])).round(3)
+            tp_vals = (entry_vals + (TP_MULT * atr_series.loc[idxs])).round(3)
+
+            signal_flag.loc[idxs] = 1
+            direction.loc[idxs] = "buy"
+            entry_price.loc[idxs] = entry_vals
+            sl.loc[idxs] = sl_vals
+            tp.loc[idxs] = tp_vals
+            signal_reason.loc[idxs] = "LSR Buy"
+            pattern_build_score.loc[idxs] = 1.15
+            pre_signal_bias.loc[idxs] = "buy"
+            pattern_id.loc[idxs] = "LSR_Buy"
+
 
         # -----------------------
         # Commit results into dataframe (vectorized assignment)
@@ -807,7 +844,7 @@ def safe_str(val, fmt=None):
     return str(val)
 
 
-def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.1):
+def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.12):
     account_info = mt5.account_info()
     symbol_info = mt5.symbol_info(symbol)
 
@@ -1369,7 +1406,7 @@ def trading_loop():
                         })
 
                         try:
-                            volume = calculate_volume(entry, sl, symbol, risk_pct=0.1)
+                            volume = calculate_volume(entry, sl, symbol, risk_pct=0.12)
                         except Exception:
                             volume = 0.01
 
