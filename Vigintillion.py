@@ -337,46 +337,7 @@ if __name__ == "__main__":
             pre_signal_bias.loc[idxs] = "buy"
             pattern_id.loc[idxs] = "HP-LR_Buy_(Looser_Version)"
 
- # -----------------------
-        # Micro Trap Sell (High-Frequency, High-R) - Tunable SL/TP (vectorized)
-        # -----------------------
-        LOOKBACK = 4  # Micro compression window
-        CONFIRM_BODY_ATR = 0.25  # Minimum body size relative to ATR for confirmation
-        SL_MULT = 1.5
-        TP_MULT = 2.5
 
-        # Recent highs/lows for trap detection
-        recent_high = df['high'].rolling(window=LOOKBACK, min_periods=LOOKBACK).max().shift(1)
-        recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
-
-        # Base condition: candle is breaking the trap to the downside
-        cond_base = (df['close'] < recent_low) & (df['close'] < df['open'])
-
-        # Confirmation: momentum shift / strong bearish body
-        cond_confirm = next_dir_bear_series & (next_body_series >= (CONFIRM_BODY_ATR * atr_series))
-
-        # Optional filter: next open within trap funnel
-        msb_mask = (cond_base & cond_confirm & next_open_valid).fillna(False)
-
-        if msb_mask.any():
-            idxs = msb_mask[msb_mask].index
-
-            entry_vals = next_open.loc[idxs].astype(float)
-            sig_low_vals = df['low'].loc[idxs].astype(float)
-            sig_high_vals = df['high'].loc[idxs].astype(float)
-
-            sl_vals = (entry_vals + (SL_MULT * atr_series.loc[idxs])).round(3)
-            tp_vals = (entry_vals - (TP_MULT * atr_series.loc[idxs])).round(3)
-
-            signal_flag.loc[idxs] = 1
-            direction.loc[idxs] = "sell"
-            entry_price.loc[idxs] = entry_vals
-            sl.loc[idxs] = sl_vals
-            tp.loc[idxs] = tp_vals
-            signal_reason.loc[idxs] = "Micro Trap Sell"
-            pattern_build_score.loc[idxs] = 1.0
-            pre_signal_bias.loc[idxs] = "sell"
-            pattern_id.loc[idxs] = "MICRO_TRAP"
         # -----------------------
         # MSB Sell (Market Structure Break) - Tunable SL/TP (vectorized)
         # -----------------------
@@ -410,52 +371,7 @@ if __name__ == "__main__":
             pre_signal_bias.loc[idxs] = "sell"
             pattern_id.loc[idxs] = "MSB_Sell"
 
-        # -----------------------
-        # Bi-Candle Reversal Sell (High-Frequency, Bi Pattern)
-        # -----------------------
-        LOOKBACK = 2                 # Look at two consecutive candles
-        CONFIRM_BODY_ATR = 0.2       # Minimum body size relative to ATR for confirmation
-        SL_MULT = 1.5
-        TP_MULT = 2.0
-        
-        # Candle 1: sets temporary high (possible micro-failure)
-        candle1_high = df['high'].shift(1)
-        candle1_close = df['close'].shift(1)
-        candle1_open = df['open'].shift(1)
-        
-        # Candle 2: reversal confirmation (strong bearish)
-        candle2_open = df['open']
-        candle2_close = df['close']
-        candle2_body = (candle2_open - candle2_close).abs()
-        
-        # Base condition: second candle rejects first candle's high
-        cond_base = (candle2_close < candle1_open) & (candle2_close < candle1_close)
-        
-        # Confirmation: candle2 has strong bearish body relative to ATR
-        cond_confirm = candle2_body >= (CONFIRM_BODY_ATR * atr_series)
-        
-        # Optional: next open is valid for entry
-        bi_mask = (cond_base & cond_confirm & next_open_valid).fillna(False)
-        
-        if bi_mask.any():
-            idxs = bi_mask[bi_mask].index
-        
-            entry_vals = next_open.loc[idxs].astype(float)
-            sig_low_vals = df['low'].loc[idxs].astype(float)
-            sig_high_vals = df['high'].loc[idxs].astype(float)
-        
-            sl_vals = (entry_vals + (SL_MULT * atr_series.loc[idxs])).round(3)
-            tp_vals = (entry_vals - (TP_MULT * atr_series.loc[idxs])).round(3)
-        
-            signal_flag.loc[idxs] = 1
-            direction.loc[idxs] = "sell"
-            entry_price.loc[idxs] = entry_vals
-            sl.loc[idxs] = sl_vals
-            tp.loc[idxs] = tp_vals
-            signal_reason.loc[idxs] = "Bi-Candle Reversal Sell"
-            pattern_build_score.loc[idxs] = 1.0
-            pre_signal_bias.loc[idxs] = "sell"
-            pattern_id.loc[idxs] = "BI_SELL"
+      
 
         # -----------------------
         # Commit results into dataframe (vectorized assignment)
