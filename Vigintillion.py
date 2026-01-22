@@ -409,52 +409,53 @@ if __name__ == "__main__":
             pattern_build_score.loc[idxs] = 1.0
             pre_signal_bias.loc[idxs] = "sell"
             pattern_id.loc[idxs] = "MSB_Sell"
-# -----------------------
-# Bi-Candle Reversal Sell (High-Frequency, Bi Pattern)
-# -----------------------
-LOOKBACK = 2                 # Look at two consecutive candles
-CONFIRM_BODY_ATR = 0.2       # Minimum body size relative to ATR for confirmation
-SL_MULT = 1.5
-TP_MULT = 2.0
 
-# Candle 1: sets temporary high (possible micro-failure)
-candle1_high = df['high'].shift(1)
-candle1_close = df['close'].shift(1)
-candle1_open = df['open'].shift(1)
-
-# Candle 2: reversal confirmation (strong bearish)
-candle2_open = df['open']
-candle2_close = df['close']
-candle2_body = (candle2_open - candle2_close).abs()
-
-# Base condition: second candle rejects first candle's high
-cond_base = (candle2_close < candle1_open) & (candle2_close < candle1_close)
-
-# Confirmation: candle2 has strong bearish body relative to ATR
-cond_confirm = candle2_body >= (CONFIRM_BODY_ATR * atr_series)
-
-# Optional: next open is valid for entry
-bi_mask = (cond_base & cond_confirm & next_open_valid).fillna(False)
-
-if bi_mask.any():
-    idxs = bi_mask[bi_mask].index
-
-    entry_vals = next_open.loc[idxs].astype(float)
-    sig_low_vals = df['low'].loc[idxs].astype(float)
-    sig_high_vals = df['high'].loc[idxs].astype(float)
-
-    sl_vals = (entry_vals + (SL_MULT * atr_series.loc[idxs])).round(3)
-    tp_vals = (entry_vals - (TP_MULT * atr_series.loc[idxs])).round(3)
-
-    signal_flag.loc[idxs] = 1
-    direction.loc[idxs] = "sell"
-    entry_price.loc[idxs] = entry_vals
-    sl.loc[idxs] = sl_vals
-    tp.loc[idxs] = tp_vals
-    signal_reason.loc[idxs] = "Bi-Candle Reversal Sell"
-    pattern_build_score.loc[idxs] = 1.0
-    pre_signal_bias.loc[idxs] = "sell"
-    pattern_id.loc[idxs] = "BI_SELL"
+        # -----------------------
+        # Bi-Candle Reversal Sell (High-Frequency, Bi Pattern)
+        # -----------------------
+        LOOKBACK = 2                 # Look at two consecutive candles
+        CONFIRM_BODY_ATR = 0.2       # Minimum body size relative to ATR for confirmation
+        SL_MULT = 1.5
+        TP_MULT = 2.0
+        
+        # Candle 1: sets temporary high (possible micro-failure)
+        candle1_high = df['high'].shift(1)
+        candle1_close = df['close'].shift(1)
+        candle1_open = df['open'].shift(1)
+        
+        # Candle 2: reversal confirmation (strong bearish)
+        candle2_open = df['open']
+        candle2_close = df['close']
+        candle2_body = (candle2_open - candle2_close).abs()
+        
+        # Base condition: second candle rejects first candle's high
+        cond_base = (candle2_close < candle1_open) & (candle2_close < candle1_close)
+        
+        # Confirmation: candle2 has strong bearish body relative to ATR
+        cond_confirm = candle2_body >= (CONFIRM_BODY_ATR * atr_series)
+        
+        # Optional: next open is valid for entry
+        bi_mask = (cond_base & cond_confirm & next_open_valid).fillna(False)
+        
+        if bi_mask.any():
+            idxs = bi_mask[bi_mask].index
+        
+            entry_vals = next_open.loc[idxs].astype(float)
+            sig_low_vals = df['low'].loc[idxs].astype(float)
+            sig_high_vals = df['high'].loc[idxs].astype(float)
+        
+            sl_vals = (entry_vals + (SL_MULT * atr_series.loc[idxs])).round(3)
+            tp_vals = (entry_vals - (TP_MULT * atr_series.loc[idxs])).round(3)
+        
+            signal_flag.loc[idxs] = 1
+            direction.loc[idxs] = "sell"
+            entry_price.loc[idxs] = entry_vals
+            sl.loc[idxs] = sl_vals
+            tp.loc[idxs] = tp_vals
+            signal_reason.loc[idxs] = "Bi-Candle Reversal Sell"
+            pattern_build_score.loc[idxs] = 1.0
+            pre_signal_bias.loc[idxs] = "sell"
+            pattern_id.loc[idxs] = "BI_SELL"
 
         # -----------------------
         # Commit results into dataframe (vectorized assignment)
