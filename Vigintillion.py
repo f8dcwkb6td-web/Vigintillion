@@ -285,59 +285,6 @@ if __name__ == "__main__":
         pre_signal_bias = pd.Series([None] * n, index=df.index, dtype=object)
         pattern_id = pd.Series([None] * n, index=df.index, dtype=object)
 
-        # -----------------------
-        # HP-LR Buy Looser (vectorized)
-        # -----------------------
-        LOOKBACK = 10
-        WICK_RATIO = .4
-        MIN_BODY = 0.25
-        VOL_MULT = 1.35
-        MIN_VOL = 1200
-        CONFIRM_BODY_ATR = 0.4
-        SL_ATR_PAD = 0.26
-        TP_ATR = 2.8
-        LOOKBACK_VOL = 20
-
-        valid_idx_series = pd.Series(np.arange(n) >= LOOKBACK, index=df.index)
-
-        cond_wick = df['lower_wick'] >= WICK_RATIO * df['body_size']
-
-        # threshold for body: max(MIN_BODY, 0.2 * atr)
-        body_thresh = pd.Series(np.maximum(MIN_BODY, 0.2 * atr_series.values), index=df.index)
-        cond_body = df['body_size'] <= body_thresh
-
-        vol_mean_lookback = df['volume'].rolling(LOOKBACK_VOL).mean()
-        vol_thresh = pd.Series(np.maximum(MIN_VOL, VOL_MULT * vol_mean_lookback.values), index=df.index)
-        cond_vol = df['volume'] >= vol_thresh
-
-        prev_low_min = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
-        cond_low = df['low'] < prev_low_min
-
-        cond_bull_candle = df['close'] > df['open']
-        cond_next_confirm = next_dir_bull_series & (next_body_series >= (CONFIRM_BODY_ATR * atr_series))
-
-        hp_mask = (valid_idx_series & cond_wick & cond_body & cond_vol & cond_low &
-                   cond_bull_candle & cond_next_confirm & next_open_valid).fillna(False)
-
-        if hp_mask.any():
-            idxs = hp_mask[hp_mask].index
-            entry_vals = next_open.loc[idxs].astype(float)
-            sig_low = df['low'].loc[idxs].astype(float)
-            sig_high = df['high'].loc[idxs].astype(float)
-
-            sl_vals = (sig_low - (SL_ATR_PAD * atr_series.loc[idxs])).round(3)
-            tp_vals = (entry_vals + (TP_ATR * atr_series.loc[idxs])).round(3)
-
-            signal_flag.loc[idxs] = 1
-            direction.loc[idxs] = "buy"
-            entry_price.loc[idxs] = entry_vals
-            sl.loc[idxs] = sl_vals
-            tp.loc[idxs] = tp_vals
-            signal_reason.loc[idxs] = "HP-LR Buy (Looser Version)"
-            pattern_build_score.loc[idxs] = 1.0
-            pre_signal_bias.loc[idxs] = "buy"
-            pattern_id.loc[idxs] = "HP-LR_Buy_(Looser_Version)"
-
 
         # -----------------------
         # MSB Sell (Market Structure Break) - Tunable SL/TP (vectorized)
@@ -1009,7 +956,7 @@ def fetch_data(symbol):
     # --- First fetch (full history) ---
     if cached_df.empty:
         logging.info(f"{symbol} — Fetching initial 8,000 candles")
-        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 8000)
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0,8000)
         if rates is None or len(rates) == 0:
             logging.error(f"{symbol} — Failed to fetch initial rates")
             return None
@@ -1250,7 +1197,7 @@ def print_win_loss_sequence(processed_signals, last_n=5000):
 def trading_loop():
     symbols = ["USDJPY"]
     poll_interval = 0.1
-    post_candle_buffer = timedelta(seconds=25)
+    post_candle_buffer = timedelta(seconds=100)
 
     logging.info("Starting Undecillion trading loop (timestamp-based + analytics)")
 
