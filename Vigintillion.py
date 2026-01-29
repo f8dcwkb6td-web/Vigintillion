@@ -1211,6 +1211,8 @@ def trading_loop():
     global processed_signals
     processed_signals = []
 
+    dummy_trade_sent = False
+
     while True:
         now = datetime.now()
 
@@ -1240,7 +1242,6 @@ def trading_loop():
 
                 accepted = df[df.get("signal_accepted", False)]
 
-                # --- BACKFILL SIGNALS FOR ANALYTICS ---
                 for _, row in accepted.iterrows():
                     processed_signals.append({
                         "time": row["time"],
@@ -1256,33 +1257,11 @@ def trading_loop():
                 if not accepted.empty:
                     last_traded_signal_time[symbol] = accepted["time"].iloc[-1]
 
-                # --- EVALUATE HISTORICAL OUTCOMES ---
                 for sig in processed_signals:
                     check_signal_outcome(df, sig)
 
-                # --- BASIC PERFORMANCE PRINT ---
                 update_win_rate()
                 print_win_loss_sequence(processed_signals)
-
-                # =========================
-                # 🔬 LOSING TRADE ANALYSIS
-                # =========================
-                if processed_signals:
-                    signals_df = pd.DataFrame(processed_signals)
-
-                    logging.info("===== LOSING TRADE ATTRIBUTE ANALYSIS =====")
-                    best_combo, filtered_df = analyze_losing_trade_attributes(
-                        df=df,
-                        signals_df=signals_df,
-                        min_trades=20
-                    )
-
-                    if best_combo:
-                        logging.info(
-                            f"Best filter combo identified: {best_combo} "
-                            f"| Remaining trades: {len(filtered_df)}"
-                        )
-                    logging.info("===== END ANALYSIS =====")
 
                 logging.info(
                     f"{symbol} — startup alignment complete, "
@@ -1292,6 +1271,8 @@ def trading_loop():
             startup_aligned = True
             time.sleep(poll_interval)
             continue
+
+
 
         # =========================
         # CANDLE CLOSE GUARD
@@ -1312,6 +1293,10 @@ def trading_loop():
                 if not is_valid_session():
                     continue
 
+               
+                # -------------------------
+                # SIGNAL PROCESSING (unchanged)
+                # -------------------------
                 df = fetch_data(symbol)
                 if df is None or df.empty:
                     continue
@@ -1333,24 +1318,11 @@ def trading_loop():
                     sig_time = latest["time"]
 
                     if last_traded_signal_time[symbol] is None or sig_time > last_traded_signal_time[symbol]:
-                        last_traded_signal_time[symbol] = sig_time
 
                         entry = latest.get("entry_price", latest.get("entry"))
                         sl = latest.get("sl")
                         tp = latest.get("tp")
                         direction = latest.get("direction")
-                        pattern_id = latest.get("pattern_id", "unknown")
-
-                        processed_signals.append({
-                            "time": sig_time,
-                            "candle_index": latest.name,
-                            "entry": entry,
-                            "sl": sl,
-                            "tp": tp,
-                            "direction": direction,
-                            "pattern_id": pattern_id,
-                            "outcome": None
-                        })
 
                         try:
                             volume = calculate_volume(entry, sl, symbol, risk_pct=0.12)
@@ -1358,14 +1330,23 @@ def trading_loop():
                             volume = 0.01
 
                         try:
-                            place_trade(
+                            result = place_trade(
                                 symbol, direction, entry, sl, tp,
                                 volume, slippage=50, magic_number=20250708
                             )
+
+                            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                                last_traded_signal_time[symbol] = sig_time
+                                logging.info(f"{symbol} — TRADE CONFIRMED at {sig_time}")
+                            else:
+                                logging.error(
+                                    f"{symbol} — TRADE REJECTED | "
+                                    f"retcode={getattr(result, 'retcode', None)}"
+                                )
+
                         except Exception:
                             logging.exception("Trade execution failed")
 
-                # --- UPDATE ANALYTICS LIVE ---
                 for sig in processed_signals:
                     check_signal_outcome(df, sig)
 
