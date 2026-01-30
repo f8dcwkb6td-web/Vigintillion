@@ -1197,7 +1197,7 @@ def print_win_loss_sequence(processed_signals, last_n=5000):
 def trading_loop():
     symbols = ["USDJPY"]
     poll_interval = 0.1
-    post_candle_buffer = timedelta(seconds=100)
+    post_candle_buffer = timedelta(seconds=40)
 
     logging.info("Starting Undecillion trading loop (timestamp-based + analytics)")
 
