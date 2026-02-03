@@ -1195,9 +1195,13 @@ def print_win_loss_sequence(processed_signals, last_n=5000):
     tail = seq[-last_n:]
     logging.info(f"Win/Loss sequence (last {len(tail)}): {' '.join(tail)}")
 def trading_loop():
+    import time
+    import logging
+    from datetime import datetime
+    import MetaTrader5 as mt5  # assuming MetaTrader5 is already imported
+
     symbols = ["USDJPY"]
-    poll_interval = 0.1
-    post_candle_buffer = timedelta(seconds=40)
+    poll_interval = 1  # slightly higher to reduce CPU load
 
     logging.info("Starting Undecillion trading loop (timestamp-based + analytics)")
 
@@ -1211,7 +1215,8 @@ def trading_loop():
     global processed_signals
     processed_signals = []
 
-    dummy_trade_sent = False
+    # Track last seen candle globally
+    last_seen_candle_time = None
 
     while True:
         now = datetime.now()
@@ -1228,6 +1233,9 @@ def trading_loop():
                 df = fetch_data(symbol)
                 if df is None or df.empty:
                     continue
+
+                # Drop the forming candle to avoid phantoms
+                df = df.iloc[:-1]
 
                 df = generate_core_signals(df)
                 df = apply_trap_mapping(df)
@@ -1272,18 +1280,8 @@ def trading_loop():
             time.sleep(poll_interval)
             continue
 
-
-
         # =========================
-        # CANDLE CLOSE GUARD
-        # =========================
-        last_closed = get_last_closed_m15(now)
-        if now - last_closed > post_candle_buffer:
-            time.sleep(poll_interval)
-            continue
-
-        # =========================
-        # LIVE LOOP
+        # LIVE LOOP WITH CANDLE GUARD
         # =========================
         for symbol in symbols:
             try:
@@ -1293,13 +1291,27 @@ def trading_loop():
                 if not is_valid_session():
                     continue
 
-               
                 # -------------------------
-                # SIGNAL PROCESSING (unchanged)
+                # FETCH RATES & NEW CANDLE DETECTION
                 # -------------------------
+                rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 3)
+                current_candle_time = rates[-1]['time']
+
+                # Skip if we already processed this candle
+                if current_candle_time == last_seen_candle_time:
+                    continue
+
+                last_seen_candle_time = current_candle_time
+
+                # Small delay to ensure data is fully updated
+                time.sleep(2)
+
                 df = fetch_data(symbol)
                 if df is None or df.empty:
                     continue
+
+                # Drop forming candle to avoid phantom triggers
+                df = df.iloc[:-1]
 
                 df = generate_core_signals(df)
                 df = apply_trap_mapping(df)
@@ -1363,3 +1375,4 @@ def trading_loop():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     trading_loop()
+
