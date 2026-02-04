@@ -116,105 +116,94 @@ def is_valid_session():
         for start, end in session_periods
     )
 def place_trade(symbol, direction, entry, sl, tp, volume, slippage, magic_number):
+    import MetaTrader5 as mt5
+    import logging
+
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
         logging.error(f"[{symbol}] Symbol info not found.")
         return None
 
-    point = symbol_info.point
-    digits = symbol_info.digits
-    min_stop_dist = symbol_info.trade_stops_level * point
-
     if not mt5.symbol_select(symbol, True):
-        logging.error(f"[{symbol}] Failed to select symbol in market watch.")
+        logging.error(f"[{symbol}] Failed to select symbol.")
         return None
 
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        logging.error(f"[{symbol}] Failed to get tick data.")
+        logging.error(f"[{symbol}] No tick data.")
         return None
 
+    point  = symbol_info.point
+    digits = symbol_info.digits
+
     market_price = tick.ask if direction == "buy" else tick.bid
-    entry = round(entry, digits)
-    sl = round(sl, digits)
-    tp = round(tp, digits)
     market_price = round(market_price, digits)
 
-    # === SL/TP Validation ===
+    # === Stops distance enforcement ===
+    min_stop_dist = symbol_info.trade_stops_level * point
+
+    sl = round(sl, digits)
+    tp = round(tp, digits)
+
     if direction == "buy":
-        if not (sl < entry < tp):
-            logging.error(f"[{symbol}] Invalid SL/TP for BUY: SL={sl}, Entry={entry}, TP={tp}")
-            return None
-        if (entry - sl) < min_stop_dist:
-            sl = round(entry - min_stop_dist, digits)
-            logging.warning(f"[{symbol}] Adjusted SL to meet minimum stop distance: {sl}")
-        if (tp - entry) < min_stop_dist:
-            tp = round(entry + min_stop_dist, digits)
-            logging.warning(f"[{symbol}] Adjusted TP to meet minimum stop distance: {tp}")
+        if (market_price - sl) < min_stop_dist:
+            sl = round(market_price - min_stop_dist, digits)
+        if (tp - market_price) < min_stop_dist:
+            tp = round(market_price + min_stop_dist, digits)
+
     else:
-        if not (tp < entry < sl):
-            logging.error(f"[{symbol}] Invalid SL/TP for SELL: TP={tp}, Entry={entry}, SL={sl}")
-            return None
-        if (sl - entry) < min_stop_dist:
-            sl = round(entry + min_stop_dist, digits)
-            logging.warning(f"[{symbol}] Adjusted SL to meet minimum stop distance: {sl}")
-        if (entry - tp) < min_stop_dist:
-            tp = round(entry - min_stop_dist, digits)
-            logging.warning(f"[{symbol}] Adjusted TP to meet minimum stop distance: {tp}")
+        if (sl - market_price) < min_stop_dist:
+            sl = round(market_price + min_stop_dist, digits)
+        if (market_price - tp) < min_stop_dist:
+            tp = round(market_price - min_stop_dist, digits)
 
-    # === Volume Sanity Check ===
-    if volume < symbol_info.volume_min:
-        logging.warning(f"[{symbol}] Volume {volume} below minimum. Adjusted to {symbol_info.volume_min}")
-        volume = symbol_info.volume_min
-    elif volume > symbol_info.volume_max:
-        logging.warning(f"[{symbol}] Volume {volume} above maximum. Adjusted to {symbol_info.volume_max}")
-        volume = symbol_info.volume_max
+    # === Volume normalization ===
+    volume = max(volume, symbol_info.volume_min)
+    volume = min(volume, symbol_info.volume_max)
 
+    step = symbol_info.volume_step
+    volume = round(volume / step) * step
     volume = round(volume, 2)
 
-    # === Trade Request ===
+    # === Build request ===
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
         "volume": volume,
         "type": mt5.ORDER_TYPE_BUY if direction == "buy" else mt5.ORDER_TYPE_SELL,
-        "price": entry,  # Use model-defined entry, not market price
+        "price": market_price,   # ✅ MARKET PRICE ONLY
         "sl": sl,
         "tp": tp,
         "deviation": slippage,
         "magic": magic_number,
-        "comment": f"Undecillion auto trade {symbol}",
+        "comment": "Undecillion auto trade",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
-    logging.info(f"[{symbol}] Sending {direction.upper()} order: Entry={entry}, SL={sl}, TP={tp}, Vol={volume}")
+    logging.info(
+        f"[{symbol}] ORDER SEND | {direction.upper()} | "
+        f"Price={market_price} SL={sl} TP={tp} Vol={volume}"
+    )
+
     result = mt5.order_send(request)
 
-    if result.retcode == mt5.TRADE_RETCODE_DONE:
-        logging.info(f"[{symbol}] Trade executed: {direction.upper()} {volume} lots at {entry}")
-        acc = mt5.account_info()
-        if acc:
-            logging.info(f"[{symbol}] Balance: {acc.balance}, Free Margin: {acc.margin_free}, Margin Level: {acc.margin_level}")
-        return pd.DataFrame([{
-            "symbol": symbol,
-            "direction": direction,
-            "entry_price": entry,
-            "sl": sl,
-            "tp": tp,
-            "volume": volume,
-            "magic": magic_number,
-            "timestamp": datetime.now(),
-        }])
+    if result is None:
+        logging.error(f"[{symbol}] order_send returned None")
+        return None
+
+    logging.info(f"[{symbol}] FULL RESULT: {result}")
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        logging.error(
+            f"[{symbol}] FAILED | retcode={result.retcode} "
+            f"| comment={result.comment}"
+        )
     else:
-        logging.error(f"[{symbol}] Trade failed | retcode={result.retcode} | comment={result.comment} | request={request}")
-        return {
-            "symbol": symbol,
-            "error": "trade_failed",
-            "retcode": result.retcode,
-            "comment": result.comment,
-            "request": request,
-        }
+        logging.info(f"[{symbol}] SUCCESS")
+
+    return result
+
 
 # Example usage of session check
 if __name__ == "__main__":
@@ -1295,7 +1284,7 @@ def trading_loop():
                 # FETCH RATES & NEW CANDLE DETECTION
                 # -------------------------
                 rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 3)
-                current_candle_time = rates[-1]['time']
+                current_candle_time = rates[1]['time']
 
                 # Skip if we already processed this candle
                 if current_candle_time == last_seen_candle_time:
