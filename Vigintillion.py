@@ -958,12 +958,7 @@ def fetch_data(symbol):
     if cached_df.empty:
         logging.info(f"{symbol} — Initial history fetch")
 
-        rates = mt5.copy_rates_from_pos(
-            symbol,
-            mt5.TIMEFRAME_M15,
-            0,
-            MAX_CANDLES
-        )
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, MAX_CANDLES)
 
         if rates is None or len(rates) == 0:
             logging.error(f"{symbol} — Failed initial fetch")
@@ -972,10 +967,7 @@ def fetch_data(symbol):
         df = pd.DataFrame(rates)
         df.rename(columns={"tick_volume": "volume"}, inplace=True)
         df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-
         df = df.sort_values("time").drop_duplicates("time")
-
-        # trim to MAX_CANDLES just in case
         df = df.tail(MAX_CANDLES).reset_index(drop=True)
 
         fetch_data._cache[symbol] = df
@@ -988,18 +980,10 @@ def fetch_data(symbol):
     last_time = cached_df["time"].max()
     next_time = last_time + timedelta(minutes=15)
 
-    missing = int(
-        (broker_now - next_time) / timedelta(minutes=15)
-    ) + 1
-
+    missing = int((broker_now - next_time) / timedelta(minutes=15)) + 1
     missing = max(1, min(missing, 50))
 
-    rates = mt5.copy_rates_from(
-        symbol,
-        mt5.TIMEFRAME_M15,
-        next_time.to_pydatetime(),
-        missing
-    )
+    rates = mt5.copy_rates_from(symbol, mt5.TIMEFRAME_M15, next_time.to_pydatetime(), missing)
 
     if rates is None or len(rates) == 0:
         logging.warning(f"{symbol} — No new rates returned")
@@ -1009,19 +993,18 @@ def fetch_data(symbol):
     df_new = pd.DataFrame(rates)
     df_new.rename(columns={"tick_volume": "volume"}, inplace=True)
     df_new["time"] = pd.to_datetime(df_new["time"], unit="s", utc=True)
-
     df_new = df_new.sort_values("time").drop_duplicates("time")
-    df_new = df_new[~df_new["time"].isin(cached_df["time"])]
 
-    if not df_new.empty:
-        cached_df = pd.concat([cached_df, df_new], ignore_index=True)
+    # --- REPLACE ANY EXISTING CANDLES WITH SAME TIME (updates last candle) ---
+    cached_df = cached_df[~cached_df["time"].isin(df_new["time"])]
+    cached_df = pd.concat([cached_df, df_new], ignore_index=True)
 
-        # --- TRIM OLDEST CANDLES TO MAINTAIN MAX_CANDLES ---
-        if len(cached_df) > MAX_CANDLES:
-            cached_df = cached_df.tail(MAX_CANDLES)
+    # --- TRIM OLDEST CANDLES TO MAX_CANDLES ---
+    if len(cached_df) > MAX_CANDLES:
+        cached_df = cached_df.tail(MAX_CANDLES)
 
-        cached_df = cached_df.sort_values("time").reset_index(drop=True)
-        fetch_data._cache[symbol] = cached_df
+    cached_df = cached_df.sort_values("time").reset_index(drop=True)
+    fetch_data._cache[symbol] = cached_df
 
     print(fetch_data._cache[symbol].tail(5))
     return fetch_data._cache[symbol]
@@ -1221,183 +1204,172 @@ def trading_loop():
     import logging
     import traceback
     from datetime import datetime, timedelta
-    import MetaTrader5 as mt5  # assuming MetaTrader5 is already imported
+    import MetaTrader5 as mt5
 
     symbols = ["USDJPY"]
-    poll_interval = 1  # slightly higher to reduce CPU load
+    poll_interval = 1
 
-    logging.info("Starting Undecillion trading loop (timestamp-based + analytics)")
+    logging.info("Starting Undecillion trading loop")
 
     SCRIPT_START_TIME = datetime.now()
     STARTUP_DELAY = timedelta(minutes=0.1)
-    startup_aligned = False
 
-    last_traded_signal_time = {s: None for s in symbols}
+    last_traded_signal_id = set()
+    last_processed_candle = {}
 
-    # --- GLOBAL ANALYTICS MEMORY ---
     global processed_signals
     processed_signals = []
 
-    # Track last seen candle globally
-    last_seen_candle_time = None
+    first_run_done = False  # Flag for startup initialization
 
     while True:
-        now = datetime.now()
+        try:
+            if datetime.now() - SCRIPT_START_TIME < STARTUP_DELAY:
+                time.sleep(poll_interval)
+                continue
 
-        if now - SCRIPT_START_TIME < STARTUP_DELAY:
-            time.sleep(poll_interval)
-            continue
-
-        # =========================
-        # STARTUP ALIGNMENT (ONCE)
-        # =========================
-        if not startup_aligned:
             for symbol in symbols:
-                df = fetch_data(symbol)
-                if df is None or df.empty:
-                    continue
 
-                # Drop the forming candle to avoid phantoms
-                df = df.iloc[:-1]
-
-                df = generate_core_signals(df)
-                df = apply_trap_mapping(df)
-                df = apply_liquidity_filter(df)
-                df = undecillion_signal_pipeline(df)
-                df = apply_mvrf_filter(df)
-                df = undecillion_signal_pipeline_with_mvrf(df)
-                df = apply_reclaim_layer(df)
-                df = apply_metacortex(df)
-
-                df = df.reset_index(drop=True)
-
-                accepted = df[df.get("signal_accepted", False)]
-
-                for _, row in accepted.iterrows():
-                    processed_signals.append({
-                        "time": row["time"],
-                        "candle_index": row.name,
-                        "entry": row.get("entry_price", row.get("entry")),
-                        "sl": row.get("sl"),
-                        "tp": row.get("tp"),
-                        "direction": row.get("direction"),
-                        "pattern_id": row.get("pattern_id", "unknown"),
-                        "outcome": None
-                    })
-
-                if not accepted.empty:
-                    last_traded_signal_time[symbol] = accepted["time"].iloc[-1]
-
-                for sig in processed_signals:
-                    check_signal_outcome(df, sig)
-
-                update_win_rate()
-                print_win_loss_sequence(processed_signals)
-
-                logging.info(
-                    f"{symbol} — startup alignment complete, "
-                    f"last_traded_signal_time set to {last_traded_signal_time[symbol]}"
-                )
-
-            startup_aligned = True
-            time.sleep(poll_interval)
-            continue
-
-        # =========================
-        # LIVE LOOP WITH CANDLE GUARD
-        # =========================
-        for symbol in symbols:
-            try:
+                # -------- SYMBOL CHECK --------
                 info = mt5.symbol_info(symbol)
-                if not info or not getattr(info, "visible", True):
+                if not info:
+                    logging.error(f"{symbol} symbol_info None")
                     continue
+
+                if not info.visible:
+                    mt5.symbol_select(symbol, True)
+
                 if not is_valid_session():
                     continue
 
-                # -------------------------
-                # FETCH RATES & NEW CANDLE DETECTION
-                # -------------------------
-                rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 3)
-                current_candle_time = rates[1]['time']
-
-                # Skip if we already processed this candle
-                if current_candle_time == last_seen_candle_time:
-                    continue
-
-                last_seen_candle_time = current_candle_time
-
-                # Small delay to ensure data is fully updated
-                time.sleep(2)
-
+                # -------- FETCH DATA --------
                 df = fetch_data(symbol)
-                if df is None or df.empty:
+                if df is None or df.empty or len(df) < 3:
                     continue
 
-                # Drop forming candle to avoid phantom triggers
-                df = df.iloc[:-1]
+                # Evaluate on all historical candles (drop last forming candle)
+                df_eval = df.iloc[:-1].copy()
 
-                df = generate_core_signals(df)
-                df = apply_trap_mapping(df)
-                df = apply_liquidity_filter(df)
-                df = undecillion_signal_pipeline(df)
-                df = apply_mvrf_filter(df)
-                df = undecillion_signal_pipeline_with_mvrf(df)
-                df = apply_reclaim_layer(df)
-                df = apply_metacortex(df)
+                # Run the full pipeline
+                df_eval = generate_core_signals(df_eval)
+                df_eval = apply_trap_mapping(df_eval)
+                df_eval = apply_liquidity_filter(df_eval)
+                df_eval = undecillion_signal_pipeline(df_eval)
+                df_eval = apply_mvrf_filter(df_eval)
+                df_eval = undecillion_signal_pipeline_with_mvrf(df_eval)
+                df_eval = apply_reclaim_layer(df_eval)
+                df_eval = apply_metacortex(df_eval)
+                df_eval = df_eval.reset_index(drop=True)
 
-                df = df.reset_index(drop=True)
-
-                accepted = df[df.get("signal_accepted", False)]
-
-                if not accepted.empty:
-                    latest = accepted.iloc[-1]
+                # -------- APPEND ALL SIGNALS TO PROCESSED_SIGNALS --------
+                accepted = df_eval[df_eval.get("signal_accepted", False)]
+                for _, latest in accepted.iterrows():
                     sig_time = latest["time"]
+                    direction = latest.get("direction")
+                    signal_id = (symbol, sig_time, direction)
 
-                    if last_traded_signal_time[symbol] is None or sig_time > last_traded_signal_time[symbol]:
+                    # Duplicate guard
+                    if signal_id in last_traded_signal_id:
+                        continue
 
-                        entry = latest.get("entry_price", latest.get("entry"))
-                        sl = latest.get("sl")
-                        tp = latest.get("tp")
-                        direction = latest.get("direction")
+                    entry = latest.get("entry_price", latest.get("entry"))
+                    sl = latest.get("sl")
+                    tp = latest.get("tp")
 
-                        try:
-                            volume = calculate_volume(entry, sl, symbol, risk_pct=0.12)
-                        except Exception:
-                            volume = 0.01
+                    processed_signals.append({
+                        "time": sig_time,
+                        "candle_index": latest.name,
+                        "entry": entry,
+                        "sl": sl,
+                        "tp": tp,
+                        "direction": direction,
+                        "pattern_id": latest.get("pattern_id", "unknown"),
+                        "outcome": None
+                    })
 
-                        try:
-                            result = place_trade(
-                                symbol,
-                                direction,
-                                entry,
-                                sl,
-                                tp,
-                                volume,
-                                slippage=50,
-                                magic_number=20250708
-                            )
+                # -------- FIRST RUN: SKIP TRADE EXECUTION --------
+                if not first_run_done:
+                    # Prime last_processed_candle with the latest closed candle
+                    last_processed_candle[symbol] = df_eval.iloc[-1]["time"]
+                    logging.info(f"{symbol} Startup initialized. Skipping trades on first run.")
+                    continue  # move to next symbol or next loop iteration
 
-                            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                                last_traded_signal_time[symbol] = sig_time
-                                logging.info(f"{symbol} — TRADE CONFIRMED at {sig_time}")
-                            else:
-                                logging.error(
-                                    f"{symbol} — TRADE REJECTED | "
-                                    f"retcode={getattr(result,'retcode',None)}"
-                                )
+                # -------- NORMAL OPERATION AFTER FIRST RUN --------
+                latest_closed_time = df_eval.iloc[-1]["time"]
 
-                        except Exception:
-                            logging.exception("Trade execution failed")
+                # New candle gate
+                if symbol in last_processed_candle:
+                    if latest_closed_time == last_processed_candle[symbol]:
+                        continue
 
+                last_processed_candle[symbol] = latest_closed_time
+                logging.info(f"{symbol} New closed candle: {latest_closed_time}")
+
+                # Filter only accepted signals on the latest closed candle
+                accepted_latest = accepted[accepted["time"] == latest_closed_time]
+                if accepted_latest.empty:
+                    continue
+
+                latest = accepted_latest.iloc[-1]
+                sig_time = latest["time"]
+                direction = latest.get("direction")
+                signal_id = (symbol, sig_time, direction)
+
+                # Duplicate guard
+                if signal_id in last_traded_signal_id:
+                    continue
+
+                entry = latest.get("entry_price", latest.get("entry"))
+                sl = latest.get("sl")
+                tp = latest.get("tp")
+
+                # -------- EXECUTE TRADE --------
+                try:
+                    volume = calculate_volume(entry, sl, symbol, risk_pct=0.12)
+                except Exception as e:
+                    logging.error(f"Volume calc failed: {e}")
+                    volume = 0.01
+
+                logging.info(
+                    f"EXECUTING TRADE | {symbol} | {direction} | "
+                    f"Entry={entry} SL={sl} TP={tp} Vol={volume}"
+                )
+
+                result = place_trade(
+                    symbol,
+                    direction,
+                    entry,
+                    sl,
+                    tp,
+                    volume,
+                    slippage=50,
+                    magic_number=20250708
+                )
+
+                if result is None:
+                    logging.error("place_trade returned None")
+                    continue
+
+                logging.info(f"MT5 RESULT | {result._asdict()}")
+
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    last_traded_signal_id.add(signal_id)
+                    logging.info(f"TRADE CONFIRMED {symbol} {sig_time}")
+                else:
+                    logging.error(f"TRADE FAILED {result.retcode}")
+
+                # -------- ANALYTICS --------
                 for sig in processed_signals:
                     check_signal_outcome(df, sig)
 
                 update_win_rate()
                 print_win_loss_sequence(processed_signals)
 
-            except Exception as e:
-                logging.error(f"{symbol} — poll error: {e}")
-                logging.error(traceback.format_exc())
+            first_run_done = True  # Mark initialization complete
+
+        except Exception as e:
+            logging.error(f"LOOP ERROR: {e}")
+            logging.error(traceback.format_exc())
 
         time.sleep(poll_interval)
 
