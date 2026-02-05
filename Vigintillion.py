@@ -924,74 +924,107 @@ def check_signal_outcome(df, sig):
 
 
 def fetch_data(symbol):
-    """
-    Fetch M15 candles with robust incremental update:
-    - First call: fetch 128,000 candles
-    - Subsequent calls: fill any missing candles and append the latest
-    """
     import pandas as pd
     import logging
     import MetaTrader5 as mt5
     from datetime import timedelta
 
-    # --- Initialize memory storage ---
+    MAX_CANDLES = 8000  # keep fixed length
+
+    # =========================
+    # CACHE INIT
+    # =========================
     if not hasattr(fetch_data, "_cache"):
         fetch_data._cache = {}
+
     if symbol not in fetch_data._cache:
         fetch_data._cache[symbol] = pd.DataFrame()
 
     cached_df = fetch_data._cache[symbol]
 
-    # --- First fetch (full history) ---
+    # =========================
+    # GET BROKER TIME
+    # =========================
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        logging.error(f"{symbol} — No tick info")
+        return None
+
+    broker_now = pd.to_datetime(tick.time, unit="s", utc=True)
+
+    # =========================
+    # FIRST FETCH
+    # =========================
     if cached_df.empty:
-        logging.info(f"{symbol} — Fetching initial 8,000 candles")
-        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0,8000)
+        logging.info(f"{symbol} — Initial history fetch")
+
+        rates = mt5.copy_rates_from_pos(
+            symbol,
+            mt5.TIMEFRAME_M15,
+            0,
+            MAX_CANDLES
+        )
+
         if rates is None or len(rates) == 0:
-            logging.error(f"{symbol} — Failed to fetch initial rates")
+            logging.error(f"{symbol} — Failed initial fetch")
             return None
 
         df = pd.DataFrame(rates)
         df.rename(columns={"tick_volume": "volume"}, inplace=True)
         df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-        df["time"] = df["time"].dt.tz_convert("America/Jamaica")
+
+        df = df.sort_values("time").drop_duplicates("time")
+
+        # trim to MAX_CANDLES just in case
+        df = df.tail(MAX_CANDLES).reset_index(drop=True)
 
         fetch_data._cache[symbol] = df
-        cached_df = df.copy()
+        print(fetch_data._cache[symbol].tail(5))
+        return fetch_data._cache[symbol]
 
-    else:
-        # --- Incremental fetch with gap-fill ---
-        last_time = cached_df["time"].max()
-        next_expected_time = last_time + timedelta(minutes=15)
+    # =========================
+    # INCREMENTAL FETCH
+    # =========================
+    last_time = cached_df["time"].max()
+    next_time = last_time + timedelta(minutes=15)
 
-        now = pd.Timestamp.now(tz="America/Jamaica")
-        # Compute how many M15 candles are missing (failsafe)
-        missing_candles = int((now - next_expected_time) / timedelta(minutes=15))
-        if missing_candles < 1:
-            missing_candles = 1  # always fetch at least the latest
+    missing = int(
+        (broker_now - next_time) / timedelta(minutes=15)
+    ) + 1
 
-        logging.info(f"{symbol} — Fetching {missing_candles} candle(s) after {last_time}")
+    missing = max(1, min(missing, 50))
 
-        rates = mt5.copy_rates_from(symbol, mt5.TIMEFRAME_M15, next_expected_time.to_pydatetime(), missing_candles)
-        if rates is not None and len(rates) > 0:
-            df_new = pd.DataFrame(rates)
-            df_new.rename(columns={"tick_volume": "volume"}, inplace=True)
-            df_new["time"] = pd.to_datetime(df_new["time"], unit="s", utc=True)
-            df_new["time"] = df_new["time"].dt.tz_convert("America/Jamaica")
+    rates = mt5.copy_rates_from(
+        symbol,
+        mt5.TIMEFRAME_M15,
+        next_time.to_pydatetime(),
+        missing
+    )
 
-            # Remove duplicates if overlapping
-            df_new = df_new[~df_new["time"].isin(cached_df["time"])]
+    if rates is None or len(rates) == 0:
+        logging.warning(f"{symbol} — No new rates returned")
+        print(cached_df.tail(5))
+        return cached_df
 
-            if not df_new.empty:
-                fetch_data._cache[symbol] = pd.concat([cached_df, df_new], ignore_index=True)
-                cached_df = fetch_data._cache[symbol]
+    df_new = pd.DataFrame(rates)
+    df_new.rename(columns={"tick_volume": "volume"}, inplace=True)
+    df_new["time"] = pd.to_datetime(df_new["time"], unit="s", utc=True)
 
-    # --- Print last 10 candles ---
-    print(cached_df.tail(10))
+    df_new = df_new.sort_values("time").drop_duplicates("time")
+    df_new = df_new[~df_new["time"].isin(cached_df["time"])]
 
-    # --- Save to CSV ---
-    cached_df.to_csv(f"{symbol.lower()}_5m_data.csv", index=False)
+    if not df_new.empty:
+        cached_df = pd.concat([cached_df, df_new], ignore_index=True)
 
-    return cached_df
+        # --- TRIM OLDEST CANDLES TO MAINTAIN MAX_CANDLES ---
+        if len(cached_df) > MAX_CANDLES:
+            cached_df = cached_df.tail(MAX_CANDLES)
+
+        cached_df = cached_df.sort_values("time").reset_index(drop=True)
+        fetch_data._cache[symbol] = cached_df
+
+    print(fetch_data._cache[symbol].tail(5))
+    return fetch_data._cache[symbol]
 
 def update_win_rate():
     total_signals = len(processed_signals)
@@ -1186,7 +1219,8 @@ def print_win_loss_sequence(processed_signals, last_n=5000):
 def trading_loop():
     import time
     import logging
-    from datetime import datetime
+    import traceback
+    from datetime import datetime, timedelta
     import MetaTrader5 as mt5  # assuming MetaTrader5 is already imported
 
     symbols = ["USDJPY"]
@@ -1314,6 +1348,7 @@ def trading_loop():
                 df = df.reset_index(drop=True)
 
                 accepted = df[df.get("signal_accepted", False)]
+
                 if not accepted.empty:
                     latest = accepted.iloc[-1]
                     sig_time = latest["time"]
@@ -1332,8 +1367,14 @@ def trading_loop():
 
                         try:
                             result = place_trade(
-                                symbol, direction, entry, sl, tp,
-                                volume, slippage=50, magic_number=20250708
+                                symbol,
+                                direction,
+                                entry,
+                                sl,
+                                tp,
+                                volume,
+                                slippage=50,
+                                magic_number=20250708
                             )
 
                             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
@@ -1342,7 +1383,7 @@ def trading_loop():
                             else:
                                 logging.error(
                                     f"{symbol} — TRADE REJECTED | "
-                                    f"retcode={getattr(result, 'retcode', None)}"
+                                    f"retcode={getattr(result,'retcode',None)}"
                                 )
 
                         except Exception:
@@ -1364,4 +1405,3 @@ def trading_loop():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     trading_loop()
-
