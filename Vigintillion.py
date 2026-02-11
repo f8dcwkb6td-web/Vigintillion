@@ -220,8 +220,12 @@ import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 def generate_core_signals(df):
+    import pandas as pd
+    import numpy as np
+
     df = df.copy()
-    # Initialize columns
+
+    # Initialize output columns
     for col in ["signal_flag", "direction", "entry_price", "sl", "tp", "signal_reason",
                 "pattern_match_score", "pattern_build_score", "pre_signal_bias", "pattern_id"]:
         if col not in df.columns:
@@ -264,18 +268,17 @@ def generate_core_signals(df):
     LOOKBACK = 8
     CONFIRM_BODY_ATR = 0.3
     SL_MULT = 1.7
-    TP_MULT = 1.7 
+    TP_MULT = 1.7
 
-    # Shifted rolling min: only previous candles
     recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
     cond_msb_base = (df['close'] < recent_low) & (df['close'] < df['open'])
     cond_msb_confirm = df['body_size'] >= (CONFIRM_BODY_ATR * df['atr14'])
     msb_mask = (cond_msb_base & cond_msb_confirm).fillna(False)
 
     for idx in msb_mask[msb_mask].index:
-        entry_val = float(df.at[idx, 'open'])
-        sl_val = round(entry_val + (SL_MULT * float(df.at[idx, 'atr14'])), 5)
-        tp_val = round(entry_val - (TP_MULT * float(df.at[idx, 'atr14'])), 5)
+        entry_val = float(df.at[idx, 'close'])  # use candle close
+        sl_val = round(entry_val + (SL_MULT * float(df.at[idx, 'atr14'])), 3)
+        tp_val = round(entry_val - (TP_MULT * float(df.at[idx, 'atr14'])), 3)
 
         signal_flag.at[idx] = 1
         direction.at[idx] = "sell"
@@ -292,9 +295,8 @@ def generate_core_signals(df):
     LOOKBACK = 15
     CONFIRM_BODY_ATR = 0.6
     SL_MULT = 1.9
-    TP_MULT = 2.5 
+    TP_MULT = 2.5
 
-    # Shifted rolling low for previous candles
     recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
     cond_sweep = df['low'] < recent_low
     cond_reclaim = (df['close'] > recent_low) & (df['close'] > df['open'])
@@ -302,9 +304,9 @@ def generate_core_signals(df):
     lsr_buy_mask = (cond_sweep & cond_reclaim & cond_confirm).fillna(False)
 
     for idx in lsr_buy_mask[lsr_buy_mask].index:
-        entry_val = float(df.at[idx, 'open'])
-        sl_val = round(entry_val - (SL_MULT * float(df.at[idx, 'atr14'])), 5)
-        tp_val = round(entry_val + (TP_MULT * float(df.at[idx, 'atr14'])), 5)
+        entry_val = float(df.at[idx, 'close'])  # use candle close
+        sl_val = round(entry_val - (SL_MULT * float(df.at[idx, 'atr14'])), 3)
+        tp_val = round(entry_val + (TP_MULT * float(df.at[idx, 'atr14'])), 3)
 
         signal_flag.at[idx] = 1
         direction.at[idx] = "buy"
@@ -336,9 +338,8 @@ def generate_core_signals(df):
 
     df['entry_signal'] = df['signal_flag']
 
-    logging.info(f"Generated {df['entry_signal'].sum()} raw signals.")
-
     return df
+
 
 
 
