@@ -219,7 +219,6 @@ import numpy as np
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-
 def generate_core_signals(df):
     df = df.copy()
     # Initialize columns
@@ -267,7 +266,8 @@ def generate_core_signals(df):
     SL_MULT = 1.7
     TP_MULT = 1.7 * 2
 
-    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min()  # no shift
+    # Shifted rolling min: only previous candles
+    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
     cond_msb_base = (df['close'] < recent_low) & (df['close'] < df['open'])
     cond_msb_confirm = df['body_size'] >= (CONFIRM_BODY_ATR * df['atr14'])
     msb_mask = (cond_msb_base & cond_msb_confirm).fillna(False)
@@ -294,7 +294,8 @@ def generate_core_signals(df):
     SL_MULT = 1.9
     TP_MULT = 2.5 * 2
 
-    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min()  # no shift
+    # Shifted rolling low for previous candles
+    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
     cond_sweep = df['low'] < recent_low
     cond_reclaim = (df['close'] > recent_low) & (df['close'] > df['open'])
     cond_confirm = df['body_size'] >= (CONFIRM_BODY_ATR * df['atr14'])
@@ -335,7 +336,10 @@ def generate_core_signals(df):
 
     df['entry_signal'] = df['signal_flag']
 
+    logging.info(f"Generated {df['entry_signal'].sum()} raw signals.")
+
     return df
+
 
 
 
