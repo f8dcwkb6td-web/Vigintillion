@@ -214,7 +214,6 @@ if __name__ == "__main__":
 # --- Global memory outside the function ---
 pattern_counters = {"MSB_Sell": 0, "LSR_Buy": 0}
 active_patterns = {"MSB_Sell": None, "LSR_Buy": None}  # track ongoing sequences
-
 def generate_core_signals(df):
     import pandas as pd
     import numpy as np
@@ -248,15 +247,7 @@ def generate_core_signals(df):
     eps = 1e-9
     n = len(df)
 
-    # Next candle series only for confirmation
-    next_open = df['open'].shift(-1)
-    next_close = df['close'].shift(-1)
-    next_open_valid = next_open.notna()
-    next_body_series = (next_close - next_open).abs()
-    next_dir_bull_series = next_close > next_open
-    next_dir_bear_series = next_close < next_open
-    atr_series = df['atr14'].astype(float)
-
+    # Output series
     signal_flag = pd.Series(0, index=df.index, dtype='int8')
     direction = pd.Series([None] * n, index=df.index, dtype=object)
     entry_price = pd.Series(np.nan, index=df.index, dtype=float)
@@ -276,26 +267,23 @@ def generate_core_signals(df):
 
     recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
     cond_msb_base = (df['close'] < recent_low) & (df['close'] < df['open'])
-    cond_msb_confirm = next_dir_bear_series & (next_body_series >= (CONFIRM_BODY_ATR * atr_series))
-    msb_mask = (cond_msb_base & cond_msb_confirm & next_open_valid).fillna(False)
+    cond_msb_confirm = df['body_size'] >= (CONFIRM_BODY_ATR * df['atr14'])
+    msb_mask = (cond_msb_base & cond_msb_confirm).fillna(False)
 
     for idx in msb_mask[msb_mask].index:
-        confirm_idx = idx + 1
-        if confirm_idx >= len(df):
-            continue
-        entry_val = float(df.at[confirm_idx, 'open'])
-        sl_val = round(entry_val + (SL_MULT * float(df.at[confirm_idx, 'atr14'])), 3)
-        tp_val = round(entry_val - (TP_MULT * float(df.at[confirm_idx, 'atr14'])), 3)
+        entry_val = float(df.at[idx, 'open'])
+        sl_val = round(entry_val + (SL_MULT * float(df.at[idx, 'atr14'])), 3)
+        tp_val = round(entry_val - (TP_MULT * float(df.at[idx, 'atr14'])), 3)
 
-        signal_flag.at[confirm_idx] = 1
-        direction.at[confirm_idx] = "sell"
-        entry_price.at[confirm_idx] = entry_val
-        sl.at[confirm_idx] = sl_val
-        tp.at[confirm_idx] = tp_val
-        signal_reason.at[confirm_idx] = "MSB Sell"
-        pattern_build_score.at[confirm_idx] = 1.0
-        pre_signal_bias.at[confirm_idx] = "sell"
-        pattern_id.at[confirm_idx] = "MSB_Sell"  # fixed recurring ID
+        signal_flag.at[idx] = 1
+        direction.at[idx] = "sell"
+        entry_price.at[idx] = entry_val
+        sl.at[idx] = sl_val
+        tp.at[idx] = tp_val
+        signal_reason.at[idx] = "MSB Sell"
+        pattern_build_score.at[idx] = 1.0
+        pre_signal_bias.at[idx] = "sell"
+        pattern_id.at[idx] = "MSB_Sell"
 
     # -----------------------
     # LSR Buy
@@ -307,26 +295,23 @@ def generate_core_signals(df):
     recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
     cond_sweep = df['low'] < recent_low
     cond_reclaim = (df['close'] > recent_low) & (df['close'] > df['open'])
-    cond_confirm = next_dir_bull_series & (next_body_series >= (CONFIRM_BODY_ATR * atr_series))
-    lsr_buy_mask = (cond_sweep & cond_reclaim & cond_confirm & next_open_valid).fillna(False)
+    cond_confirm = df['body_size'] >= (CONFIRM_BODY_ATR * df['atr14'])
+    lsr_buy_mask = (cond_sweep & cond_reclaim & cond_confirm).fillna(False)
 
     for idx in lsr_buy_mask[lsr_buy_mask].index:
-        confirm_idx = idx + 1
-        if confirm_idx >= len(df):
-            continue
-        entry_val = float(df.at[confirm_idx, 'open'])
-        sl_val = round(entry_val - (SL_MULT * float(df.at[confirm_idx, 'atr14'])), 3)
-        tp_val = round(entry_val + (TP_MULT * float(df.at[confirm_idx, 'atr14'])), 3)
+        entry_val = float(df.at[idx, 'open'])
+        sl_val = round(entry_val - (SL_MULT * float(df.at[idx, 'atr14'])), 3)
+        tp_val = round(entry_val + (TP_MULT * float(df.at[idx, 'atr14'])), 3)
 
-        signal_flag.at[confirm_idx] = 1
-        direction.at[confirm_idx] = "buy"
-        entry_price.at[confirm_idx] = entry_val
-        sl.at[confirm_idx] = sl_val
-        tp.at[confirm_idx] = tp_val
-        signal_reason.at[confirm_idx] = "LSR Buy"
-        pattern_build_score.at[confirm_idx] = 1.15
-        pre_signal_bias.at[confirm_idx] = "buy"
-        pattern_id.at[confirm_idx] = "LSR_Buy"  # fixed recurring ID
+        signal_flag.at[idx] = 1
+        direction.at[idx] = "buy"
+        entry_price.at[idx] = entry_val
+        sl.at[idx] = sl_val
+        tp.at[idx] = tp_val
+        signal_reason.at[idx] = "LSR Buy"
+        pattern_build_score.at[idx] = 1.15
+        pre_signal_bias.at[idx] = "buy"
+        pattern_id.at[idx] = "LSR_Buy"
 
     # -----------------------
     # Commit results
@@ -349,7 +334,6 @@ def generate_core_signals(df):
     df['entry_signal'] = df['signal_flag']
 
     return df
-
 
 def apply_trap_mapping(df):
     """
