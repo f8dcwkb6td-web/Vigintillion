@@ -264,7 +264,7 @@ def generate_core_signals(df):
     LOOKBACK = 8
     CONFIRM_BODY_ATR = 0.3
     SL_MULT = 1.7
-    TP_MULT = 1.7 * 2
+    TP_MULT = 1.7 
 
     # Shifted rolling min: only previous candles
     recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
@@ -292,7 +292,7 @@ def generate_core_signals(df):
     LOOKBACK = 15
     CONFIRM_BODY_ATR = 0.6
     SL_MULT = 1.9
-    TP_MULT = 2.5 * 2
+    TP_MULT = 2.5 
 
     # Shifted rolling low for previous candles
     recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
