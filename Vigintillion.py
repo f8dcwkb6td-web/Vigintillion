@@ -211,7 +211,9 @@ if __name__ == "__main__":
         print("We are inside a trading session.")
     else:
         print("Out of trading sessions now.")
-
+# --- Global memory outside the function ---
+pattern_counters = {"MSB_Sell": 0, "LSR_Buy": 0}
+active_patterns = {"MSB_Sell": None, "LSR_Buy": None}  # track ongoing sequences
 
 def generate_core_signals(df):
     import pandas as pd
@@ -238,7 +240,6 @@ def generate_core_signals(df):
     df['lower_wick'] = df[['close', 'open']].min(axis=1) - df['low']
     df['candle_range'] = df['high'] - df['low']
     df['bull_bear_ratio'] = (df['close'] - df['open']) / (df['candle_range'] + 1e-9)
-
     df['volume_ratio'] = df['volume'] / (df['volume'].rolling(10).mean() + 1e-9)
 
     if 'atr14' not in df.columns:
@@ -247,15 +248,13 @@ def generate_core_signals(df):
     eps = 1e-9
     n = len(df)
 
-    # --- Keep original next series for confirmation, but do NOT use them for entry assignment ---
+    # Next candle series only for confirmation
     next_open = df['open'].shift(-1)
     next_close = df['close'].shift(-1)
     next_open_valid = next_open.notna()
-
     next_body_series = (next_close - next_open).abs()
     next_dir_bull_series = next_close > next_open
     next_dir_bear_series = next_close < next_open
-
     atr_series = df['atr14'].astype(float)
 
     signal_flag = pd.Series(0, index=df.index, dtype='int8')
@@ -278,24 +277,25 @@ def generate_core_signals(df):
     recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
     cond_msb_base = (df['close'] < recent_low) & (df['close'] < df['open'])
     cond_msb_confirm = next_dir_bear_series & (next_body_series >= (CONFIRM_BODY_ATR * atr_series))
-
     msb_mask = (cond_msb_base & cond_msb_confirm & next_open_valid).fillna(False)
 
-    if msb_mask.any():
-        idxs = msb_mask[msb_mask].index
-        entry_vals = df['open'].loc[idxs].astype(float)  # <-- Use current candle open, not next_open
-        sl_vals = (entry_vals + (SL_MULT * atr_series.loc[idxs])).round(3)
-        tp_vals = (entry_vals - (TP_MULT * atr_series.loc[idxs])).round(3)
+    for idx in msb_mask[msb_mask].index:
+        confirm_idx = idx + 1
+        if confirm_idx >= len(df):
+            continue
+        entry_val = float(df.at[confirm_idx, 'open'])
+        sl_val = round(entry_val + (SL_MULT * float(df.at[confirm_idx, 'atr14'])), 3)
+        tp_val = round(entry_val - (TP_MULT * float(df.at[confirm_idx, 'atr14'])), 3)
 
-        signal_flag.loc[idxs] = 1
-        direction.loc[idxs] = "sell"
-        entry_price.loc[idxs] = entry_vals
-        sl.loc[idxs] = sl_vals
-        tp.loc[idxs] = tp_vals
-        signal_reason.loc[idxs] = "MSB Sell"
-        pattern_build_score.loc[idxs] = 1.0
-        pre_signal_bias.loc[idxs] = "sell"
-        pattern_id.loc[idxs] = "MSB_Sell"
+        signal_flag.at[confirm_idx] = 1
+        direction.at[confirm_idx] = "sell"
+        entry_price.at[confirm_idx] = entry_val
+        sl.at[confirm_idx] = sl_val
+        tp.at[confirm_idx] = tp_val
+        signal_reason.at[confirm_idx] = "MSB Sell"
+        pattern_build_score.at[confirm_idx] = 1.0
+        pre_signal_bias.at[confirm_idx] = "sell"
+        pattern_id.at[confirm_idx] = "MSB_Sell"  # fixed recurring ID
 
     # -----------------------
     # LSR Buy
@@ -308,24 +308,25 @@ def generate_core_signals(df):
     cond_sweep = df['low'] < recent_low
     cond_reclaim = (df['close'] > recent_low) & (df['close'] > df['open'])
     cond_confirm = next_dir_bull_series & (next_body_series >= (CONFIRM_BODY_ATR * atr_series))
-
     lsr_buy_mask = (cond_sweep & cond_reclaim & cond_confirm & next_open_valid).fillna(False)
 
-    if lsr_buy_mask.any():
-        idxs = lsr_buy_mask[lsr_buy_mask].index
-        entry_vals = df['open'].loc[idxs].astype(float)  # <-- Use current candle open, not next_open
-        sl_vals = (entry_vals - (SL_MULT * atr_series.loc[idxs])).round(3)
-        tp_vals = (entry_vals + (TP_MULT * atr_series.loc[idxs])).round(3)
+    for idx in lsr_buy_mask[lsr_buy_mask].index:
+        confirm_idx = idx + 1
+        if confirm_idx >= len(df):
+            continue
+        entry_val = float(df.at[confirm_idx, 'open'])
+        sl_val = round(entry_val - (SL_MULT * float(df.at[confirm_idx, 'atr14'])), 3)
+        tp_val = round(entry_val + (TP_MULT * float(df.at[confirm_idx, 'atr14'])), 3)
 
-        signal_flag.loc[idxs] = 1
-        direction.loc[idxs] = "buy"
-        entry_price.loc[idxs] = entry_vals
-        sl.loc[idxs] = sl_vals
-        tp.loc[idxs] = tp_vals
-        signal_reason.loc[idxs] = "LSR Buy"
-        pattern_build_score.loc[idxs] = 1.15
-        pre_signal_bias.loc[idxs] = "buy"
-        pattern_id.loc[idxs] = "LSR_Buy"
+        signal_flag.at[confirm_idx] = 1
+        direction.at[confirm_idx] = "buy"
+        entry_price.at[confirm_idx] = entry_val
+        sl.at[confirm_idx] = sl_val
+        tp.at[confirm_idx] = tp_val
+        signal_reason.at[confirm_idx] = "LSR Buy"
+        pattern_build_score.at[confirm_idx] = 1.15
+        pre_signal_bias.at[confirm_idx] = "buy"
+        pattern_id.at[confirm_idx] = "LSR_Buy"  # fixed recurring ID
 
     # -----------------------
     # Commit results
@@ -1176,25 +1177,28 @@ def print_win_loss_sequence(processed_signals, last_n=5000):
     tail = seq[-last_n:]
     logging.info(f"Win/Loss sequence (last {len(tail)}): {' '.join(tail)}")
 processed_signals = []  # keep track of all signals and outcomes
+import time
+import logging
+import traceback
+from datetime import datetime
+import MetaTrader5 as mt5
+import pandas as pd
+
+# --- Global memory for signals ---
+processed_signals = []  # keeps all signals and their outcomes
+traded_signals = set()
+startup_complete = False
 def trading_loop():
-    import time
-    import logging
-    import traceback
-    from datetime import datetime
-    import MetaTrader5 as mt5
+    global processed_signals, traded_signals, startup_complete
 
     symbols = ["USDJPY"]
     poll_interval = 0.1  # seconds
 
     logging.info("Starting fully-logged execution loop")
 
-    traded_signals = set()
-    startup_complete = False
-
     while True:
         try:
             for symbol in symbols:
-
                 # --- SYMBOL CHECK ---
                 info = mt5.symbol_info(symbol)
                 if not info:
@@ -1211,7 +1215,7 @@ def trading_loop():
                 # --- DROP FORMING CANDLE ---
                 df = df.iloc[:-1].copy()
 
-                # --- RUN PIPELINE ---
+                # --- RUN SIGNAL PIPELINE ---
                 df = generate_core_signals(df)
                 df = apply_trap_mapping(df)
                 df = apply_liquidity_filter(df)
@@ -1224,14 +1228,25 @@ def trading_loop():
                 if "signal_accepted" not in df.columns:
                     continue
 
-                accepted = df[df["signal_accepted"] == True]
-                logging.info(f"DEBUG | {symbol} accepted signals count: {len(accepted)}")
+                accepted = df[df["signal_accepted"] == True].copy()
+                logging.info(f"{symbol} accepted signals count: {len(accepted)}")
 
-                # --- STARTUP PHASE ---
+                # --- STARTUP SYNC ---
                 if not startup_complete:
                     for _, row in accepted.iterrows():
                         sig_id = (symbol, row["time"], row.get("direction"))
                         traded_signals.add(sig_id)
+                        processed_signals.append({
+                            "symbol": symbol,
+                            "time": row["time"],
+                            "direction": row.get("direction"),
+                            "entry": row.get("entry_price", row.get("entry")),
+                            "sl": row["sl"],
+                            "tp": row["tp"],
+                            "candle_index": row.name,
+                            "outcome": None,
+                            "pattern_id": row.get("pattern_id")  # <-- carry pattern_id here
+                        })
                     startup_complete = True
                     logging.info(f"{symbol} startup sync complete")
                     continue
@@ -1239,15 +1254,14 @@ def trading_loop():
                 # --- NORMAL OPERATION ---
                 for _, row in accepted.iterrows():
                     sig_id = (symbol, row["time"], row.get("direction"))
-
-                    # Skip if already traded
                     if sig_id in traded_signals:
                         continue
 
-                    direction = row["direction"]
                     entry = row.get("entry_price", row.get("entry"))
                     sl = row["sl"]
                     tp = row["tp"]
+                    direction = row.get("direction")
+                    pid = row.get("pattern_id")  # <-- grab persistent pattern_id
 
                     try:
                         volume = calculate_volume(entry, sl, symbol, risk_pct=0.12)
@@ -1258,9 +1272,10 @@ def trading_loop():
                     # --- LOG TRADE ATTEMPT ---
                     logging.info(
                         f"ATTEMPTING TRADE | Symbol={symbol} Direction={direction} "
-                        f"Entry={entry} SL={sl} TP={tp} Vol={volume}"
+                        f"Entry={entry} SL={sl} TP={tp} Vol={volume} Pattern={pid}"
                     )
 
+                    # --- PLACE TRADE ---
                     result = place_trade(
                         symbol,
                         direction,
@@ -1272,14 +1287,13 @@ def trading_loop():
                         magic_number=20250708
                     )
 
-                    # --- LOG FULL RESULT ---
                     if result is None:
                         logging.error("MT5 TRADE RESULT IS NONE")
                         continue
 
                     logging.info(
                         f"MT5 TRADE RESULT | retcode={result.retcode} | "
-                        f"Symbol={symbol} Direction={direction} Entry={entry} SL={sl} TP={tp} Vol={volume}"
+                        f"Symbol={symbol} Direction={direction} Entry={entry} SL={sl} TP={tp} Vol={volume} Pattern={pid}"
                     )
 
                     if result.retcode == mt5.TRADE_RETCODE_DONE:
@@ -1288,12 +1302,38 @@ def trading_loop():
                     else:
                         logging.warning("TRADE FAILED ❌")
 
+                    # --- UPDATE processed_signals ---
+                    processed_signals.append({
+                        "symbol": symbol,
+                        "time": row["time"],
+                        "direction": direction,
+                        "entry": entry,
+                        "sl": sl,
+                        "tp": tp,
+                        "candle_index": row.name,
+                        "outcome": None,
+                        "pattern_id": pid  # <-- persist pattern_id here
+                    })
+
+                # --- EVALUATE WIN/LOSS ---
+                for sig in processed_signals:
+                    check_signal_outcome(df, sig)
+
+                # --- LOG WIN-LOSS SEQUENCE AND WIN RATE ---
+                print_win_loss_sequence(processed_signals, last_n=5000)
+                update_win_rate()
+
+                # --- ANALYZE LOSING TRADE ATTRIBUTES ---
+                signals_df = pd.DataFrame(processed_signals)
+                if "pattern_id" not in signals_df.columns:
+                    signals_df["pattern_id"] = signals_df.index  # fallback if no pattern_id
+                analyze_losing_trade_attributes(df, signals_df, min_trades=50)
+
         except Exception as e:
             logging.error(f"LOOP ERROR: {e}")
             logging.error(traceback.format_exc())
 
         time.sleep(poll_interval)
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
