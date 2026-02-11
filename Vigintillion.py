@@ -263,9 +263,9 @@ def generate_core_signals(df):
     LOOKBACK = 8
     CONFIRM_BODY_ATR = 0.3
     SL_MULT = 1.7
-    TP_MULT = 1.7
+    TP_MULT = 1.7 * 2  # double TP
 
-    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min()  # <-- shift removed
+    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
     cond_msb_base = (df['close'] < recent_low) & (df['close'] < df['open'])
     cond_msb_confirm = df['body_size'] >= (CONFIRM_BODY_ATR * df['atr14'])
     msb_mask = (cond_msb_base & cond_msb_confirm).fillna(False)
@@ -290,9 +290,9 @@ def generate_core_signals(df):
     LOOKBACK = 15
     CONFIRM_BODY_ATR = 0.6
     SL_MULT = 1.9
-    TP_MULT = 2.5
+    TP_MULT = 2.5 * 2  # double TP
 
-    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min()  # <-- shift removed
+    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
     cond_sweep = df['low'] < recent_low
     cond_reclaim = (df['close'] > recent_low) & (df['close'] > df['open'])
     cond_confirm = df['body_size'] >= (CONFIRM_BODY_ATR * df['atr14'])
@@ -328,11 +328,13 @@ def generate_core_signals(df):
     vol_mean_lookback4 = df['volume'].rolling(window=4, min_periods=1).mean()
     signaled_idx = df.index[df['signal_flag'] == 1]
     if len(signaled_idx) > 0:
-        df.loc[signaled_idx, 'volume_ratio'] = (df.loc[signaled_idx, 'volume'] / (vol_mean_lookback4.loc[signaled_idx] + eps))
+        df.loc[signaled_idx, 'volume_ratio'] = (df.loc[signaled_idx, 'volume'] /
+                                                (vol_mean_lookback4.loc[signaled_idx] + eps))
 
     df['entry_signal'] = df['signal_flag']
 
     return df
+
 
 
 def apply_trap_mapping(df):
