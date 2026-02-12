@@ -240,11 +240,11 @@ def generate_core_signals(df):
     df = df.ffill().bfill()
 
     # Candle attributes
-    df['body_size'] = (df['close'] - df['open']).abs()
-    df['upper_wick'] = df['high'] - df[['close','open']].max(axis=1)
-    df['lower_wick'] = df[['close','open']].min(axis=1) - df['low']
-    df['candle_range'] = df['high'] - df['low']
-    df['bull_bear_ratio'] = (df['close'] - df['open'])/(df['candle_range']+1e-9)
+    df['body_size'] = (df['close']-df['open']).abs()
+    df['upper_wick'] = df['high']-df[['close','open']].max(axis=1)
+    df['lower_wick'] = df[['close','open']].min(axis=1)-df['low']
+    df['candle_range'] = df['high']-df['low']
+    df['bull_bear_ratio'] = (df['close']-df['open'])/(df['candle_range']+1e-9)
     df['volume_ratio'] = df['volume']/(df['volume'].rolling(10).mean()+1e-9)
 
     if 'atr14' not in df.columns:
@@ -253,92 +253,104 @@ def generate_core_signals(df):
     eps = 1e-9
     n = len(df)
 
+    next_open = df['open'].shift(-1)
+    next_close = df['close'].shift(-1)
+    next_open_valid = next_open.notna()
+
+    next_body_series = (next_close-next_open).abs()
+    next_dir_bull_series = next_close>next_open
+    next_dir_bear_series = next_close<next_open
+
     atr_series = df['atr14'].astype(float)
 
-    signal_flag = pd.Series(0,index=df.index,dtype='int8')
-    direction = pd.Series([None]*n,index=df.index,dtype=object)
-    entry_price = pd.Series(np.nan,index=df.index,dtype=float)
-    sl = pd.Series(np.nan,index=df.index,dtype=float)
-    tp = pd.Series(np.nan,index=df.index,dtype=float)
-    signal_reason = pd.Series([None]*n,index=df.index,dtype=object)
-    pattern_build_score = pd.Series(0.0,index=df.index,dtype=float)
-    pre_signal_bias = pd.Series([None]*n,index=df.index,dtype=object)
-    pattern_id = pd.Series([None]*n,index=df.index,dtype=object)
+    # Initialize signal series
+    signal_flag = pd.Series(0, index=df.index, dtype='int8')
+    direction = pd.Series([None]*n, index=df.index, dtype=object)
+    entry_price = pd.Series(np.nan, index=df.index, dtype=float)
+    sl = pd.Series(np.nan, index=df.index, dtype=float)
+    tp = pd.Series(np.nan, index=df.index, dtype=float)
+    signal_reason = pd.Series([None]*n, index=df.index, dtype=object)
+    pattern_build_score = pd.Series(0.0, index=df.index, dtype=float)
+    pre_signal_bias = pd.Series([None]*n, index=df.index, dtype=object)
+    pattern_id = pd.Series([None]*n, index=df.index, dtype=object)
 
     # -----------------------
-    # MSB Sell (NO CONFIRM)
+    # MSB Sell
     LOOKBACK = 8
-    SL_MULT = 1.7
+    CONFIRM_BODY_ATR = 0.3
+    SL_MULT = 1.4
     TP_MULT = 1.7
 
-    recent_low = df['low'].rolling(window=LOOKBACK,min_periods=LOOKBACK).min().shift(1)
-    msb_mask = ((df['close']<recent_low)&(df['close']<df['open'])).fillna(False)
+    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
+    cond_msb_base = (df['close'] < recent_low) & (df['close'] < df['open'])
+    cond_msb_confirm = next_dir_bear_series & (next_body_series >= (CONFIRM_BODY_ATR*atr_series))
+    msb_mask = (cond_msb_base & cond_msb_confirm & next_open_valid).fillna(False)
 
     for idx in msb_mask[msb_mask].index:
-        entry_val = float(df.at[idx,'close'])
-        sl_val = round(entry_val + SL_MULT*float(df.at[idx,'atr14']),3)
-        tp_val = round(entry_val - TP_MULT*float(df.at[idx,'atr14']),3)
+        entry_val = float(df.at[idx, 'close'])
+        sl_val = round(entry_val + (SL_MULT * float(df.at[idx, 'atr14'])), 3)
+        tp_val = round(entry_val - (TP_MULT * float(df.at[idx, 'atr14'])), 3)
 
-        signal_flag.at[idx]=1
-        direction.at[idx]="sell"
-        entry_price.at[idx]=entry_val
-        sl.at[idx]=sl_val
-        tp.at[idx]=tp_val
-        signal_reason.at[idx]="MSB Sell"
-        pattern_build_score.at[idx]=1.0
-        pre_signal_bias.at[idx]="sell"
-        pattern_id.at[idx]="MSB_Sell"
+        signal_flag.at[idx] = 1
+        direction.at[idx] = "sell"
+        entry_price.at[idx] = entry_val
+        sl.at[idx] = sl_val
+        tp.at[idx] = tp_val
+        signal_reason.at[idx] = "MSB Sell"
+        pattern_build_score.at[idx] = 1.0
+        pre_signal_bias.at[idx] = "sell"
+        pattern_id.at[idx] = "MSB_Sell"
 
     # -----------------------
-    # LSR Buy (NO CONFIRM)
+    # LSR Buy
     LOOKBACK = 15
-    SL_MULT = 1.9
+    CONFIRM_BODY_ATR = 0.6
+    SL_MULT = 1.4
     TP_MULT = 2.5
 
-    recent_low = df['low'].rolling(window=LOOKBACK,min_periods=LOOKBACK).min().shift(1)
-    lsr_buy_mask = ((df['low']<recent_low)&
-                    (df['close']>recent_low)&
-                    (df['close']>df['open'])).fillna(False)
+    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
+    cond_sweep = df['low'] < recent_low
+    cond_reclaim = (df['close'] > recent_low) & (df['close'] > df['open'])
+    cond_confirm = next_dir_bull_series & (next_body_series >= (CONFIRM_BODY_ATR*atr_series))
+    lsr_buy_mask = (cond_sweep & cond_reclaim & cond_confirm & next_open_valid).fillna(False)
 
     for idx in lsr_buy_mask[lsr_buy_mask].index:
-        entry_val = float(df.at[idx,'close'])
-        sl_val = round(entry_val - SL_MULT*float(df.at[idx,'atr14']),3)
-        tp_val = round(entry_val + TP_MULT*float(df.at[idx,'atr14']),3)
+        entry_val = float(df.at[idx, 'close'])
+        sl_val = round(entry_val - (SL_MULT * float(df.at[idx, 'atr14'])), 3)
+        tp_val = round(entry_val + (TP_MULT * float(df.at[idx, 'atr14'])), 3)
 
-        signal_flag.at[idx]=1
-        direction.at[idx]="buy"
-        entry_price.at[idx]=entry_val
-        sl.at[idx]=sl_val
-        tp.at[idx]=tp_val
-        signal_reason.at[idx]="LSR Buy"
-        pattern_build_score.at[idx]=1.15
-        pre_signal_bias.at[idx]="buy"
-        pattern_id.at[idx]="LSR_Buy"
+        signal_flag.at[idx] = 1
+        direction.at[idx] = "buy"
+        entry_price.at[idx] = entry_val
+        sl.at[idx] = sl_val
+        tp.at[idx] = tp_val
+        signal_reason.at[idx] = "LSR Buy"
+        pattern_build_score.at[idx] = 1.15
+        pre_signal_bias.at[idx] = "buy"
+        pattern_id.at[idx] = "LSR_Buy"
 
-    # Commit
-    df['signal_flag']=signal_flag
-    df['direction']=direction
-    df['entry_price']=entry_price
-    df['sl']=sl
-    df['tp']=tp
-    df['signal_reason']=signal_reason
-    df['pattern_build_score']=pattern_build_score
-    df['pre_signal_bias']=pre_signal_bias
-    df['pattern_id']=pattern_id
+    # -----------------------
+    # Commit results
+    df['signal_flag'] = signal_flag
+    df['direction'] = direction
+    df['entry_price'] = entry_price
+    df['sl'] = sl
+    df['tp'] = tp
+    df['signal_reason'] = signal_reason
+    df['pattern_build_score'] = pattern_build_score
+    df['pre_signal_bias'] = pre_signal_bias
+    df['pattern_id'] = pattern_id
 
-    vol_mean_lookback4=df['volume'].rolling(window=4,min_periods=1).mean()
-    signaled_idx=df.index[df['signal_flag']==1]
-
-    if len(signaled_idx)>0:
-        df.loc[signaled_idx,'volume_ratio']=(
-            df.loc[signaled_idx,'volume']/
-            (vol_mean_lookback4.loc[signaled_idx]+eps)
+    vol_mean_lookback4 = df['volume'].rolling(window=4, min_periods=1).mean()
+    signaled_idx = df.index[df['signal_flag'] == 1]
+    if len(signaled_idx) > 0:
+        df.loc[signaled_idx, 'volume_ratio'] = (
+            df.loc[signaled_idx, 'volume'] / (vol_mean_lookback4.loc[signaled_idx] + eps)
         )
 
-    df['entry_signal']=df['signal_flag']
+    df['entry_signal'] = df['signal_flag']
 
     return df
-
 
 def apply_trap_mapping(df):
     """
@@ -746,7 +758,7 @@ def safe_str(val, fmt=None):
     return str(val)
 
 
-def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.12):
+def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.1):
     account_info = mt5.account_info()
     symbol_info = mt5.symbol_info(symbol)
 
@@ -1253,7 +1265,7 @@ def trading_loop():
                     pid = row.get("pattern_id")  # <-- grab persistent pattern_id
 
                     try:
-                        volume = calculate_volume(entry, sl, symbol, risk_pct=0.12)
+                        volume = calculate_volume(entry, sl, symbol, risk_pct=0.10)
                     except Exception as e:
                         volume = 0.01
                         logging.error(f"Volume calculation failed: {e}")
