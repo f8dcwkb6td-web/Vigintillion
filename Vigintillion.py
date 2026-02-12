@@ -225,6 +225,7 @@ def generate_core_signals(df):
 
     df = df.copy()
 
+    # Initialize output columns
     for col in ["signal_flag","direction","entry_price","sl","tp","signal_reason",
                 "pattern_match_score","pattern_build_score","pre_signal_bias","pattern_id"]:
         if col not in df.columns:
@@ -238,59 +239,45 @@ def generate_core_signals(df):
 
     df = df.ffill().bfill()
 
-    df['body_size'] = (df['close']-df['open']).abs()
-    df['upper_wick'] = df['high']-df[['close','open']].max(axis=1)
-    df['lower_wick'] = df[['close','open']].min(axis=1)-df['low']
-    df['candle_range'] = df['high']-df['low']
-    df['bull_bear_ratio'] = (df['close']-df['open'])/(df['candle_range']+1e-9)
+    # Candle attributes
+    df['body_size'] = (df['close'] - df['open']).abs()
+    df['upper_wick'] = df['high'] - df[['close','open']].max(axis=1)
+    df['lower_wick'] = df[['close','open']].min(axis=1) - df['low']
+    df['candle_range'] = df['high'] - df['low']
+    df['bull_bear_ratio'] = (df['close'] - df['open'])/(df['candle_range']+1e-9)
     df['volume_ratio'] = df['volume']/(df['volume'].rolling(10).mean()+1e-9)
 
     if 'atr14' not in df.columns:
         df['atr14'] = df['candle_range'].rolling(14,min_periods=8).mean().bfill()
 
-    eps=1e-9
-    n=len(df)
-
-    next_open = df['open'].shift(-1)
-    next_close = df['close'].shift(-1)
-    next_open_valid = next_open.notna()
-
-    next_body_series = (next_close-next_open).abs()
-    next_dir_bull_series = next_close>next_open
-    next_dir_bear_series = next_close<next_open
+    eps = 1e-9
+    n = len(df)
 
     atr_series = df['atr14'].astype(float)
-    atr_next = atr_series.shift(-1)
 
-    signal_flag=pd.Series(0,index=df.index,dtype='int8')
-    direction=pd.Series([None]*n,index=df.index,dtype=object)
-    entry_price=pd.Series(np.nan,index=df.index,dtype=float)
-    sl=pd.Series(np.nan,index=df.index,dtype=float)
-    tp=pd.Series(np.nan,index=df.index,dtype=float)
-    signal_reason=pd.Series([None]*n,index=df.index,dtype=object)
-    pattern_build_score=pd.Series(0.0,index=df.index,dtype=float)
-    pre_signal_bias=pd.Series([None]*n,index=df.index,dtype=object)
-    pattern_id=pd.Series([None]*n,index=df.index,dtype=object)
+    signal_flag = pd.Series(0,index=df.index,dtype='int8')
+    direction = pd.Series([None]*n,index=df.index,dtype=object)
+    entry_price = pd.Series(np.nan,index=df.index,dtype=float)
+    sl = pd.Series(np.nan,index=df.index,dtype=float)
+    tp = pd.Series(np.nan,index=df.index,dtype=float)
+    signal_reason = pd.Series([None]*n,index=df.index,dtype=object)
+    pattern_build_score = pd.Series(0.0,index=df.index,dtype=float)
+    pre_signal_bias = pd.Series([None]*n,index=df.index,dtype=object)
+    pattern_id = pd.Series([None]*n,index=df.index,dtype=object)
 
-    # --- MSB SELL ---
-    LOOKBACK=8
-    CONFIRM_BODY_ATR=0.3
-    SL_MULT=1.7
-    TP_MULT=1.7
+    # -----------------------
+    # MSB Sell (NO CONFIRM)
+    LOOKBACK = 8
+    SL_MULT = 1.7
+    TP_MULT = 1.7
 
-    recent_low=df['low'].rolling(LOOKBACK,min_periods=LOOKBACK).min().shift(1)
-
-    cond_msb_base=(df['close']<recent_low)&(df['close']<df['open'])
-    cond_msb_confirm=next_dir_bear_series&(next_body_series>=(CONFIRM_BODY_ATR*atr_series))
-
-    msb_mask=(cond_msb_base&cond_msb_confirm&next_open_valid).fillna(False)
+    recent_low = df['low'].rolling(window=LOOKBACK,min_periods=LOOKBACK).min().shift(1)
+    msb_mask = ((df['close']<recent_low)&(df['close']<df['open'])).fillna(False)
 
     for idx in msb_mask[msb_mask].index:
-        entry_val=float(next_close.loc[idx])
-        atr_val=float(atr_next.loc[idx])
-
-        sl_val=round(entry_val+(SL_MULT*atr_val),3)
-        tp_val=round(entry_val-(TP_MULT*atr_val),3)
+        entry_val = float(df.at[idx,'close'])
+        sl_val = round(entry_val + SL_MULT*float(df.at[idx,'atr14']),3)
+        tp_val = round(entry_val - TP_MULT*float(df.at[idx,'atr14']),3)
 
         signal_flag.at[idx]=1
         direction.at[idx]="sell"
@@ -302,26 +289,21 @@ def generate_core_signals(df):
         pre_signal_bias.at[idx]="sell"
         pattern_id.at[idx]="MSB_Sell"
 
-    # --- LSR BUY ---
-    LOOKBACK=15
-    CONFIRM_BODY_ATR=0.6
-    SL_MULT=1.9
-    TP_MULT=2.5
+    # -----------------------
+    # LSR Buy (NO CONFIRM)
+    LOOKBACK = 15
+    SL_MULT = 1.9
+    TP_MULT = 2.5
 
-    recent_low=df['low'].rolling(LOOKBACK,min_periods=LOOKBACK).min().shift(1)
-
-    cond_sweep=df['low']<recent_low
-    cond_reclaim=(df['close']>recent_low)&(df['close']>df['open'])
-    cond_confirm=next_dir_bull_series&(next_body_series>=(CONFIRM_BODY_ATR*atr_series))
-
-    lsr_buy_mask=(cond_sweep&cond_reclaim&cond_confirm&next_open_valid).fillna(False)
+    recent_low = df['low'].rolling(window=LOOKBACK,min_periods=LOOKBACK).min().shift(1)
+    lsr_buy_mask = ((df['low']<recent_low)&
+                    (df['close']>recent_low)&
+                    (df['close']>df['open'])).fillna(False)
 
     for idx in lsr_buy_mask[lsr_buy_mask].index:
-        entry_val=float(next_close.loc[idx])
-        atr_val=float(atr_next.loc[idx])
-
-        sl_val=round(entry_val-(SL_MULT*atr_val),3)
-        tp_val=round(entry_val+(TP_MULT*atr_val),3)
+        entry_val = float(df.at[idx,'close'])
+        sl_val = round(entry_val - SL_MULT*float(df.at[idx,'atr14']),3)
+        tp_val = round(entry_val + TP_MULT*float(df.at[idx,'atr14']),3)
 
         signal_flag.at[idx]=1
         direction.at[idx]="buy"
@@ -333,6 +315,7 @@ def generate_core_signals(df):
         pre_signal_bias.at[idx]="buy"
         pattern_id.at[idx]="LSR_Buy"
 
+    # Commit
     df['signal_flag']=signal_flag
     df['direction']=direction
     df['entry_price']=entry_price
@@ -343,7 +326,7 @@ def generate_core_signals(df):
     df['pre_signal_bias']=pre_signal_bias
     df['pattern_id']=pattern_id
 
-    vol_mean_lookback4=df['volume'].rolling(4,min_periods=1).mean()
+    vol_mean_lookback4=df['volume'].rolling(window=4,min_periods=1).mean()
     signaled_idx=df.index[df['signal_flag']==1]
 
     if len(signaled_idx)>0:
@@ -355,6 +338,7 @@ def generate_core_signals(df):
     df['entry_signal']=df['signal_flag']
 
     return df
+
 
 def apply_trap_mapping(df):
     """
