@@ -273,61 +273,54 @@ def generate_core_signals(df):
     pattern_build_score = pd.Series(0.0, index=df.index, dtype=float)
     pre_signal_bias = pd.Series([None]*n, index=df.index, dtype=object)
     pattern_id = pd.Series([None]*n, index=df.index, dtype=object)
+    # ==============================
+    # VWAP Bounce Sell — USDJPY M15
+    # ==============================
 
-    # -----------------------
-    # MSB Sell
-    LOOKBACK = 8
-    CONFIRM_BODY_ATR = 0.3
-    SL_MULT = 1.4
-    TP_MULT = 1.7
+    LOOKBACK = 250 # for rolling VWAP approximation
+    SL_BUFFER_PIPS = 50  # 3 pips
+    TP_R_MULT = 0.80  # 1:1 R:R
+    VOLUME_MULT = 1.3 # min volume for confirmation
+    DEVIATION_PIPS = 140  # minimum deviation from VWAP for entry
+    pip = 0.01  # USDJPY pip
+    decimals = 3  # USDJPY IC Markets precision
 
-    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
-    cond_msb_base = (df['close'] < recent_low) & (df['close'] < df['open'])
-    cond_msb_confirm = next_dir_bear_series & (next_body_series >= (CONFIRM_BODY_ATR*atr_series))
-    msb_mask = (cond_msb_base & cond_msb_confirm & next_open_valid).fillna(False)
+    # --- Calculate intraday VWAP anchored to last LOOKBACK candles ---
+    df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+    vwap_series = (
+            (df['typical_price'].rolling(LOOKBACK).apply(lambda x: np.sum(x * df['volume'].iloc[x.index]), raw=False)) /
+            (df['volume'].rolling(LOOKBACK).sum())
+    )
 
-    for idx in msb_mask[msb_mask].index:
+    # --- Conditions for Sell (same as your original) ---
+    cond_deviation = df['close'] < (vwap_series - DEVIATION_PIPS * pip)  # same as buy
+    cond_rejection = df['close'] > df['open']  # same as buy
+
+    # --- Volume confirmation ---
+    vol_avg = df['volume'].rolling(window=LOOKBACK, min_periods=LOOKBACK).mean()
+    cond_volume = df['volume'] >= vol_avg * VOLUME_MULT
+
+    # --- Combine conditions ---
+    vwap_sell_mask = (cond_deviation & cond_rejection & cond_volume).fillna(False)
+
+    # --- Write signals ---
+    for idx in vwap_sell_mask[vwap_sell_mask].index:
         entry_val = float(df.at[idx, 'close'])
-        sl_val = round(entry_val + (SL_MULT * float(df.at[idx, 'atr14'])), 3)
-        tp_val = round(entry_val - (TP_MULT * float(df.at[idx, 'atr14'])), 3)
+        atr_val = float(df.at[idx, 'atr14'])
+
+        # Swap SL and TP only (your original math)
+        tp_val = round(entry_val - (SL_BUFFER_PIPS * pip), decimals)  # former SL
+        sl_val = round(entry_val + (TP_R_MULT * (entry_val - tp_val)), decimals)  # former TP
 
         signal_flag.at[idx] = 1
         direction.at[idx] = "sell"
         entry_price.at[idx] = entry_val
         sl.at[idx] = sl_val
         tp.at[idx] = tp_val
-        signal_reason.at[idx] = "MSB Sell"
-        pattern_build_score.at[idx] = 1.0
+        signal_reason.at[idx] = "VWAP Sell"
+        pattern_build_score.at[idx] = 1.8
         pre_signal_bias.at[idx] = "sell"
-        pattern_id.at[idx] = "MSB_Sell"
-
-    # -----------------------
-    # LSR Buy
-    LOOKBACK = 15
-    CONFIRM_BODY_ATR = 0.6
-    SL_MULT = 1.4
-    TP_MULT = 2.5
-
-    recent_low = df['low'].rolling(window=LOOKBACK, min_periods=LOOKBACK).min().shift(1)
-    cond_sweep = df['low'] < recent_low
-    cond_reclaim = (df['close'] > recent_low) & (df['close'] > df['open'])
-    cond_confirm = next_dir_bull_series & (next_body_series >= (CONFIRM_BODY_ATR*atr_series))
-    lsr_buy_mask = (cond_sweep & cond_reclaim & cond_confirm & next_open_valid).fillna(False)
-
-    for idx in lsr_buy_mask[lsr_buy_mask].index:
-        entry_val = float(df.at[idx, 'close'])
-        sl_val = round(entry_val - (SL_MULT * float(df.at[idx, 'atr14'])), 3)
-        tp_val = round(entry_val + (TP_MULT * float(df.at[idx, 'atr14'])), 3)
-
-        signal_flag.at[idx] = 1
-        direction.at[idx] = "buy"
-        entry_price.at[idx] = entry_val
-        sl.at[idx] = sl_val
-        tp.at[idx] = tp_val
-        signal_reason.at[idx] = "LSR Buy"
-        pattern_build_score.at[idx] = 1.15
-        pre_signal_bias.at[idx] = "buy"
-        pattern_id.at[idx] = "LSR_Buy"
+        pattern_id.at[idx] = "VWAP_Sell"
 
     # -----------------------
     # Commit results
@@ -349,6 +342,8 @@ def generate_core_signals(df):
         )
 
     df['entry_signal'] = df['signal_flag']
+
+
 
     return df
 
@@ -843,17 +838,22 @@ def safe_float(val, fallback=None):
         return float(val)
     except Exception:
         return fallback
+def check_signal_outcome(df, sig, spread=0.0, use_next_open=True):
+    """
+    Bias-reduced TP/SL outcome checker.
 
-def check_signal_outcome(df, sig):
+    Fixes:
+    - Worst-case resolution when TP & SL hit same candle
+    - Optional spread modeling
+    - Next-candle entry to avoid look-ahead bias
     """
-    Determine if a signal hit TP or SL first, ignoring the 'direction' label.
-    Works purely with numeric TP and SL values relative to the price.
-    """
+
     if sig.get("outcome") is not None:
-        return sig  # already calculated
+        return sig
 
-    # Find the signal index
+    # --- Locate signal index ---
     signal_idx = None
+
     sig_time = sig.get("time")
     if sig_time and "time" in df.columns:
         times = pd.to_datetime(df["time"])
@@ -864,50 +864,74 @@ def check_signal_outcome(df, sig):
 
     if signal_idx is None:
         signal_idx = sig.get("candle_index")
-        if signal_idx is None or not (0 <= signal_idx < len(df)):
-            return sig  # cannot find signal
 
-    sl = float(sig.get("sl", None))
-    tp = float(sig.get("tp", None))
-    entry = float(sig.get("entry", df.iloc[signal_idx]["close"]))
+    if signal_idx is None or not (0 <= signal_idx < len(df)-1):
+        return sig
+
+    # --- Entry price ---
+    if "entry" in sig and sig["entry"] is not None:
+        entry = float(sig["entry"])
+    else:
+        if use_next_open and signal_idx+1 < len(df):
+            entry = float(df.iloc[signal_idx+1]["open"])
+        else:
+            entry = float(df.iloc[signal_idx]["close"])
+
+    # --- SL/TP ---
+    sl = sig.get("sl")
+    tp = sig.get("tp")
 
     if sl is None or tp is None:
-        return sig  # cannot determine outcome without SL/TP
+        return sig
 
-    # Iterate subsequent candles
-    for i in range(signal_idx + 1, len(df)):
+    sl = float(sl)
+    tp = float(tp)
+
+    # --- Apply spread ---
+    if spread > 0:
+        if tp > entry:
+            tp -= spread
+        else:
+            tp += spread
+
+        if sl > entry:
+            sl += spread
+        else:
+            sl -= spread
+
+    # --- Iterate forward ---
+    for i in range(signal_idx+1, len(df)):
         row = df.iloc[i]
-        high, low, open_ = row["high"], row["low"], row["open"]
 
-        # If both TP and SL hit in same candle
+        high = float(row["high"])
+        low  = float(row["low"])
+
         tp_hit = (tp >= entry and high >= tp) or (tp < entry and low <= tp)
         sl_hit = (sl >= entry and high >= sl) or (sl < entry and low <= sl)
 
+        # Worst-case rule removes optimism bias
         if tp_hit and sl_hit:
-            # Compare distance from open to determine which hit first
-            dist_tp = abs(open_ - tp)
-            dist_sl = abs(open_ - sl)
-            sig["outcome"] = "win" if dist_tp <= dist_sl else "loss"
-            return sig
-        elif tp_hit:
-            sig["outcome"] = "win"
-            return sig
-        elif sl_hit:
             sig["outcome"] = "loss"
             return sig
 
-    # If neither TP nor SL hit
+        if sl_hit:
+            sig["outcome"] = "loss"
+            return sig
+
+        if tp_hit:
+            sig["outcome"] = "win"
+            return sig
+
     sig["outcome"] = "open"
     return sig
 
-
-def fetch_data(symbol):
+def fetch_data(symbol, csv_path=None):
     import pandas as pd
     import logging
     import MetaTrader5 as mt5
     from datetime import timedelta
 
-    MAX_CANDLES = 8000  # keep fixed length
+    MAX_CANDLES = 2000  # keep fixed length
 
     # =========================
     # CACHE INIT
@@ -949,7 +973,11 @@ def fetch_data(symbol):
         df = df.tail(MAX_CANDLES).reset_index(drop=True)
 
         fetch_data._cache[symbol] = df
-        print(fetch_data._cache[symbol].tail(5))
+
+        if csv_path:
+            df.to_csv(csv_path, index=False)
+            print(f"{symbol} — Data written to {csv_path}")
+
         return fetch_data._cache[symbol]
 
     # =========================
@@ -966,6 +994,8 @@ def fetch_data(symbol):
     if rates is None or len(rates) == 0:
         logging.warning(f"{symbol} — No new rates returned")
         print(cached_df.tail(5))
+        if csv_path:
+            cached_df.to_csv(csv_path, index=False)
         return cached_df
 
     df_new = pd.DataFrame(rates)
@@ -983,6 +1013,11 @@ def fetch_data(symbol):
 
     cached_df = cached_df.sort_values("time").reset_index(drop=True)
     fetch_data._cache[symbol] = cached_df
+
+    # --- WRITE TO CSV ---
+    if csv_path:
+        cached_df.to_csv(csv_path, index=False)
+        print(f"{symbol} — Data updated and written to {csv_path}")
 
     print(fetch_data._cache[symbol].tail(5))
     return fetch_data._cache[symbol]
@@ -1208,8 +1243,8 @@ def trading_loop():
                 if not info.visible:
                     mt5.symbol_select(symbol, True)
 
-                # --- FETCH DATA ---
-                df = fetch_data(symbol)
+                df = fetch_data("USDJPY", csv_path="USDJPY_M15.csv")
+
                 if df is None or len(df) < 3:
                     continue
 
