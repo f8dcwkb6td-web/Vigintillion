@@ -61,7 +61,7 @@ symbols = ["USDJPY"]
 lot_step = 0.01
 
 slippage = 3
-magic_number = 20250708  # Unique identifier for the Undecillion engine
+magic_number = 45650708  # Unique identifier for the Undecillion engine
 timezone_offset = -5  # Jamaica timezone is UTC-5
 
 session_times = {
@@ -274,54 +274,49 @@ def generate_core_signals(df):
     pre_signal_bias = pd.Series([None]*n, index=df.index, dtype=object)
     pattern_id = pd.Series([None]*n, index=df.index, dtype=object)
     # ==============================
-    # VWAP Bounce Sell — USDJPY M15
+    # 2-CANDLE BULL CONTINUATION — Raw Pattern
     # ==============================
 
-    LOOKBACK = 250 # for rolling VWAP approximation
-    SL_BUFFER_PIPS = 50  # 3 pips
-    TP_R_MULT = 0.80  # 1:1 R:R
-    VOLUME_MULT = 1.3 # min volume for confirmation
-    DEVIATION_PIPS = 140  # minimum deviation from VWAP for entry
-    pip = 0.01  # USDJPY pip
-    decimals = 3  # USDJPY IC Markets precision
+    # ---- Configurable Variables ----
+    PIP_VALUE = 0.01  # USDJPY
+    SL_PAD_PIPS = 15  # SL pad in pips
+    RISK_TO_REWARD = 1.0  # TP relative to SL
 
-    # --- Calculate intraday VWAP anchored to last LOOKBACK candles ---
-    df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
-    vwap_series = (
-            (df['typical_price'].rolling(LOOKBACK).apply(lambda x: np.sum(x * df['volume'].iloc[x.index]), raw=False)) /
-            (df['volume'].rolling(LOOKBACK).sum())
-    )
+    RANGE_FRACTION = 1  # optional multiplier for the combined range
 
-    # --- Conditions for Sell (same as your original) ---
-    cond_deviation = df['close'] < (vwap_series - DEVIATION_PIPS * pip)  # same as buy
-    cond_rejection = df['close'] > df['open']  # same as buy
+    # ---- Raw 2-candle continuation logic
+    for i in range(2, len(df)):
 
-    # --- Volume confirmation ---
-    vol_avg = df['volume'].rolling(window=LOOKBACK, min_periods=LOOKBACK).mean()
-    cond_volume = df['volume'] >= vol_avg * VOLUME_MULT
+        c1 = df.iloc[i - 2]
+        c2 = df.iloc[i - 1]
+        c_entry = df.iloc[i]
 
-    # --- Combine conditions ---
-    vwap_sell_mask = (cond_deviation & cond_rejection & cond_volume).fillna(False)
+        # ---- Check two consecutive bullish candles
+        if not (c1['close'] > c1['open'] and c2['close'] > c2['open']):
+            continue
 
-    # --- Write signals ---
-    for idx in vwap_sell_mask[vwap_sell_mask].index:
-        entry_val = float(df.at[idx, 'close'])
-        atr_val = float(df.at[idx, 'atr14'])
+        # ---- Entry
+        entry = c_entry['close']
 
-        # Swap SL and TP only (your original math)
-        tp_val = round(entry_val - (SL_BUFFER_PIPS * pip), decimals)  # former SL
-        sl_val = round(entry_val + (TP_R_MULT * (entry_val - tp_val)), decimals)  # former TP
+        # ---- Compute combined range of the two candles
+        combined_low = min(c1['low'], c2['low'])
+        combined_high = max(c1['high'], c2['high'])
+        combined_range = combined_high - combined_low
 
-        signal_flag.at[idx] = 1
-        direction.at[idx] = "sell"
-        entry_price.at[idx] = entry_val
-        sl.at[idx] = sl_val
-        tp.at[idx] = tp_val
-        signal_reason.at[idx] = "VWAP Sell"
-        pattern_build_score.at[idx] = 1.8
-        pre_signal_bias.at[idx] = "sell"
-        pattern_id.at[idx] = "VWAP_Sell"
+        # ---- SL/TP
+        sl_val = combined_low - (SL_PAD_PIPS * PIP_VALUE)  # SL pad below the two-candle low
+        tp_val = entry + (entry - sl_val) * RISK_TO_REWARD  # TP scales to maintain R:R
 
+        # ---- Write signals
+        signal_flag.at[i] = 1
+        direction.at[i] = "buy"
+        entry_price.at[i] = entry
+        sl.at[i] = round(sl_val, 3)
+        tp.at[i] = round(tp_val, 3)
+        signal_reason.at[i] = "2-Candle Bull Continuation"
+        pattern_build_score.at[i] = 1.0
+        pre_signal_bias.at[i] = "buy"
+        pattern_id.at[i] = "BULL_CONT_2C"
     # -----------------------
     # Commit results
     df['signal_flag'] = signal_flag
@@ -479,7 +474,7 @@ def apply_liquidity_filter(df):
         df.at[idx, "liquidity_reject"] = proximity_score >= 0.7
     # === Long-Term Ceiling Protection ===
     long_lookback = 1000  # bars to consider for multi-month high
-    ceiling_threshold = 0.0005  # price distance threshold (adjust to your symbol precision)
+    ceiling_threshold = 0.005  # price distance threshold (adjust to your symbol precision)
 
     for i in range(lookback_range, len(df)):
         idx = df.index[i]
@@ -753,7 +748,7 @@ def safe_str(val, fmt=None):
     return str(val)
 
 
-def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.1):
+def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.05):
     account_info = mt5.account_info()
     symbol_info = mt5.symbol_info(symbol)
 
@@ -931,7 +926,8 @@ def fetch_data(symbol, csv_path=None):
     import MetaTrader5 as mt5
     from datetime import timedelta
 
-    MAX_CANDLES = 2000  # keep fixed length
+    MAX_CANDLES = 1500  # keep fixed length/*-+
+
 
     # =========================
     # CACHE INIT
@@ -1228,30 +1224,78 @@ def trading_loop():
     global processed_signals, traded_signals, startup_complete
 
     symbols = ["USDJPY"]
-    poll_interval = 0.1  # seconds
+    poll_interval = 0.2  # seconds
 
     logging.info("Starting fully-logged execution loop")
 
+    # =============================
+    # GLOBAL PAUSE STATE
+    # =============================
+    execution_paused = False
+    MAX_CONSECUTIVE_LOSSES = 1  # set to 2 if you want two losses
+
+    def check_pause():
+        nonlocal execution_paused
+
+        # Only look at CLOSED outcomes
+        closed = [
+            sig["outcome"]
+            for sig in reversed(processed_signals)
+            if sig.get("outcome") in ("win", "loss")
+        ]
+
+        if not closed:
+            return
+
+        recent = closed[:MAX_CONSECUTIVE_LOSSES]
+
+        # --- RESUME CONDITION ---
+        if execution_paused:
+            if recent and recent[0] == "win":
+                execution_paused = False
+                logging.info("Execution resumed ✅")
+            return
+
+        # --- PAUSE CONDITION ---
+        if (
+            len(recent) == MAX_CONSECUTIVE_LOSSES
+            and all(o == "loss" for o in recent)
+        ):
+            execution_paused = True
+            logging.info(
+                f"Execution paused due to {MAX_CONSECUTIVE_LOSSES} consecutive losses ❌"
+            )
+
+    # =============================
+    # MAIN LOOP
+    # =============================
     while True:
         try:
             for symbol in symbols:
-                # --- SYMBOL CHECK ---
+
+                # =============================
+                # SYMBOL CHECK
+                # =============================
                 info = mt5.symbol_info(symbol)
                 if not info:
                     logging.error(f"{symbol} symbol_info None")
                     continue
+
                 if not info.visible:
                     mt5.symbol_select(symbol, True)
 
-                df = fetch_data("USDJPY", csv_path="USDJPY_M15.csv")
-
+                # =============================
+                # FETCH DATA
+                # =============================
+                df = fetch_data(symbol, csv_path="USDJPY_M15.csv")
                 if df is None or len(df) < 3:
                     continue
 
-                # --- DROP FORMING CANDLE ---
                 df = df.iloc[:-1].copy()
 
-                # --- RUN SIGNAL PIPELINE ---
+                # =============================
+                # SIGNAL PIPELINE (UNCHANGED)
+                # =============================
                 df = generate_core_signals(df)
                 df = apply_trap_mapping(df)
                 df = apply_liquidity_filter(df)
@@ -1267,10 +1311,15 @@ def trading_loop():
                 accepted = df[df["signal_accepted"] == True].copy()
                 logging.info(f"{symbol} accepted signals count: {len(accepted)}")
 
-                # --- STARTUP SYNC ---
+                # =============================
+                # STARTUP SYNC
+                # =============================
                 if not startup_complete:
                     for _, row in accepted.iterrows():
                         sig_id = (symbol, row["time"], row.get("direction"))
+                        if sig_id in traded_signals:
+                            continue
+
                         traded_signals.add(sig_id)
                         processed_signals.append({
                             "symbol": symbol,
@@ -1281,15 +1330,26 @@ def trading_loop():
                             "tp": row["tp"],
                             "candle_index": row.name,
                             "outcome": None,
-                            "pattern_id": row.get("pattern_id")  # <-- carry pattern_id here
+                            "pattern_id": row.get("pattern_id")
                         })
+
                     startup_complete = True
                     logging.info(f"{symbol} startup sync complete")
                     continue
 
-                # --- NORMAL OPERATION ---
+                # =============================
+                # CHECK PAUSE STATE
+                # =============================
+                check_pause()
+
+                # =============================
+                # PROCESS SIGNALS
+                # =============================
                 for _, row in accepted.iterrows():
+
                     sig_id = (symbol, row["time"], row.get("direction"))
+
+                    # Prevent duplicate signal logging
                     if sig_id in traded_signals:
                         continue
 
@@ -1297,48 +1357,11 @@ def trading_loop():
                     sl = row["sl"]
                     tp = row["tp"]
                     direction = row.get("direction")
-                    pid = row.get("pattern_id")  # <-- grab persistent pattern_id
+                    pid = row.get("pattern_id")
 
-                    try:
-                        volume = calculate_volume(entry, sl, symbol, risk_pct=0.10)
-                    except Exception as e:
-                        volume = 0.01
-                        logging.error(f"Volume calculation failed: {e}")
-
-                    # --- LOG TRADE ATTEMPT ---
-                    logging.info(
-                        f"ATTEMPTING TRADE | Symbol={symbol} Direction={direction} "
-                        f"Entry={entry} SL={sl} TP={tp} Vol={volume} Pattern={pid}"
-                    )
-
-                    # --- PLACE TRADE ---
-                    result = place_trade(
-                        symbol,
-                        direction,
-                        entry,
-                        sl,
-                        tp,
-                        volume,
-                        slippage=50,
-                        magic_number=20250708
-                    )
-
-                    if result is None:
-                        logging.error("MT5 TRADE RESULT IS NONE")
-                        continue
-
-                    logging.info(
-                        f"MT5 TRADE RESULT | retcode={result.retcode} | "
-                        f"Symbol={symbol} Direction={direction} Entry={entry} SL={sl} TP={tp} Vol={volume} Pattern={pid}"
-                    )
-
-                    if result.retcode == mt5.TRADE_RETCODE_DONE:
-                        traded_signals.add(sig_id)
-                        logging.info("TRADE FIRED ✅")
-                    else:
-                        logging.warning("TRADE FAILED ❌")
-
-                    # --- UPDATE processed_signals ---
+                    # ----------------------------------
+                    # ALWAYS LOG SIGNAL (CRITICAL FIX)
+                    # ----------------------------------
                     processed_signals.append({
                         "symbol": symbol,
                         "time": row["time"],
@@ -1348,28 +1371,76 @@ def trading_loop():
                         "tp": tp,
                         "candle_index": row.name,
                         "outcome": None,
-                        "pattern_id": pid  # <-- persist pattern_id here
+                        "pattern_id": pid
                     })
 
-                # --- EVALUATE WIN/LOSS ---
+                    traded_signals.add(sig_id)
+
+                    # ----------------------------------
+                    # EXECUTION LAYER ONLY
+                    # ----------------------------------
+                    if execution_paused:
+                        logging.info(
+                            f"Execution paused; signal logged but trade skipped at {row['time']}"
+                        )
+                        continue
+
+                    try:
+                        volume = calculate_volume(
+                            entry, sl, symbol, risk_pct=0.10
+                        )
+                    except Exception as e:
+                        volume = 0.01
+                        logging.error(f"Volume calculation failed: {e}")
+
+                    logging.info(
+                        f"ATTEMPTING TRADE | Symbol={symbol} "
+                        f"Direction={direction} Entry={entry} "
+                        f"SL={sl} TP={tp} Vol={volume} Pattern={pid}"
+                    )
+
+                    result = place_trade(
+                        symbol,
+                        direction,
+                        sl,
+                        entry,
+                        tp,
+                        volume,
+                        slippage=50,
+                        magic_number=45650708
+                    )
+
+                    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                        logging.info("TRADE FIRED ✅")
+                    else:
+                        logging.warning("TRADE FAILED ❌")
+
+                # =============================
+                # EVALUATE OUTCOMES
+                # =============================
                 for sig in processed_signals:
                     check_signal_outcome(df, sig)
 
-                # --- LOG WIN-LOSS SEQUENCE AND WIN RATE ---
+                # =============================
+                # LOG STATS
+                # =============================
                 print_win_loss_sequence(processed_signals, last_n=5000)
                 update_win_rate()
 
-                # --- ANALYZE LOSING TRADE ATTRIBUTES ---
                 signals_df = pd.DataFrame(processed_signals)
                 if "pattern_id" not in signals_df.columns:
-                    signals_df["pattern_id"] = signals_df.index  # fallback if no pattern_id
-                analyze_losing_trade_attributes(df, signals_df, min_trades=50)
+                    signals_df["pattern_id"] = signals_df.index
+
+                analyze_losing_trade_attributes(
+                    df, signals_df, min_trades=50
+                )
 
         except Exception as e:
             logging.error(f"LOOP ERROR: {e}")
             logging.error(traceback.format_exc())
 
         time.sleep(poll_interval)
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
