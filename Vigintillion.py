@@ -281,33 +281,32 @@ def generate_core_signals(df):
     PIP_VALUE = 0.01  # USDJPY
     SL_PAD_PIPS = 15  # SL pad in pips
     RISK_TO_REWARD = 1.0  # TP relative to SL
-
     RANGE_FRACTION = 1  # optional multiplier for the combined range
 
-    # ---- Raw 2-candle continuation logic
+    # ---- Raw 2-candle continuation logic ----
     for i in range(2, len(df)):
 
         c1 = df.iloc[i - 2]
         c2 = df.iloc[i - 1]
         c_entry = df.iloc[i]
 
-        # ---- Check two consecutive bullish candles
+        # ---- Check two consecutive bullish candles ----
         if not (c1['close'] > c1['open'] and c2['close'] > c2['open']):
             continue
 
-        # ---- Entry
+        # ---- Entry ----
         entry = c_entry['close']
 
-        # ---- Compute combined range of the two candles
+        # ---- Compute combined range of the two candles ----
         combined_low = min(c1['low'], c2['low'])
         combined_high = max(c1['high'], c2['high'])
         combined_range = combined_high - combined_low
 
-        # ---- SL/TP
+        # ---- SL/TP ----
         sl_val = combined_low - (SL_PAD_PIPS * PIP_VALUE)  # SL pad below the two-candle low
         tp_val = entry + (entry - sl_val) * RISK_TO_REWARD  # TP scales to maintain R:R
 
-        # ---- Write signals
+        # ---- Write signals ----
         signal_flag.at[i] = 1
         direction.at[i] = "buy"
         entry_price.at[i] = entry
@@ -1243,7 +1242,6 @@ def trading_loop():
             for sig in reversed(processed_signals)
             if sig.get("outcome") in ("win", "loss")
         ]
-
         if not closed:
             return
 
@@ -1308,6 +1306,9 @@ def trading_loop():
                 if "signal_accepted" not in df.columns:
                     continue
 
+                # --- NEW: track previous accepted count ---
+                previous_accepted_count = len([sig for sig in processed_signals if sig["symbol"]==symbol and sig.get("pattern_id")])
+
                 accepted = df[df["signal_accepted"] == True].copy()
                 logging.info(f"{symbol} accepted signals count: {len(accepted)}")
 
@@ -1346,7 +1347,6 @@ def trading_loop():
                 # PROCESS SIGNALS
                 # =============================
                 for _, row in accepted.iterrows():
-
                     sig_id = (symbol, row["time"], row.get("direction"))
 
                     # Prevent duplicate signal logging
@@ -1387,7 +1387,7 @@ def trading_loop():
 
                     try:
                         volume = calculate_volume(
-                            entry, sl, symbol, risk_pct=0.05
+                            entry, sl, symbol, risk_pct=0.10
                         )
                     except Exception as e:
                         volume = 0.01
@@ -1402,8 +1402,8 @@ def trading_loop():
                     result = place_trade(
                         symbol,
                         direction,
-                        sl,
                         entry,
+                        sl,
                         tp,
                         volume,
                         slippage=50,
@@ -1414,6 +1414,11 @@ def trading_loop():
                         logging.info("TRADE FIRED ✅")
                     else:
                         logging.warning("TRADE FAILED ❌")
+
+                # --- NEW: refresh accepted count for analytics immediately ---
+                new_accepted_count = len([sig for sig in processed_signals if sig["symbol"]==symbol and sig.get("pattern_id")])
+                if new_accepted_count > previous_accepted_count:
+                    logging.info(f"{symbol} NEW signals added to analytics: {new_accepted_count - previous_accepted_count}")
 
                 # =============================
                 # EVALUATE OUTCOMES
