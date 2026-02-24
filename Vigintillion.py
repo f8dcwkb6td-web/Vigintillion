@@ -1387,7 +1387,7 @@ def trading_loop():
 
                     try:
                         volume = calculate_volume(
-                            entry, sl, symbol, risk_pct=0.10
+                            entry, sl, symbol, risk_pct=0.065
                         )
                     except Exception as e:
                         volume = 0.01
