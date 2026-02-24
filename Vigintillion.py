@@ -542,7 +542,7 @@ def apply_mvrf_filter(df):
     df["mvrf_reject"] = False
 
     lookback = 6
-    body_threshold = 0.25
+    body_threshold = 0.5
     wick_threshold = 0.55
     volatility_spike_multiplier = 1.6
     max_allowed_anomalies = 3
@@ -1379,6 +1379,18 @@ def trading_loop():
                     # ----------------------------------
                     # EXECUTION LAYER ONLY
                     # ----------------------------------
+
+                    # --- HARD MT5 ACCOUNT POSITION CHECK ---
+                    positions = mt5.positions_get()
+                    open_positions = len(positions) if positions else 0
+
+                    if open_positions >= 3:
+                        logging.info(
+                            f"MT5 ACCOUNT LIMIT REACHED ({open_positions} open positions) — "
+                            f"Signal logged but trade blocked at {row['time']}"
+                        )
+                        continue  # DO NOT TRADE, DO NOT RETRY LATER
+
                     if execution_paused:
                         logging.info(
                             f"Execution paused; signal logged but trade skipped at {row['time']}"
@@ -1387,7 +1399,7 @@ def trading_loop():
 
                     try:
                         volume = calculate_volume(
-                            entry, sl, symbol, risk_pct=0.065
+                            entry, sl, symbol, risk_pct=0.05
                         )
                     except Exception as e:
                         volume = 0.01
@@ -1414,7 +1426,6 @@ def trading_loop():
                         logging.info("TRADE FIRED ✅")
                     else:
                         logging.warning("TRADE FAILED ❌")
-
                 # --- NEW: refresh accepted count for analytics immediately ---
                 new_accepted_count = len([sig for sig in processed_signals if sig["symbol"]==symbol and sig.get("pattern_id")])
                 if new_accepted_count > previous_accepted_count:
