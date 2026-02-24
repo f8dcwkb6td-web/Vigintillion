@@ -1227,16 +1227,12 @@ def trading_loop():
 
     logging.info("Starting fully-logged execution loop")
 
-    # =============================
-    # GLOBAL PAUSE STATE
-    # =============================
     execution_paused = False
-    MAX_CONSECUTIVE_LOSSES = 1  # set to 2 if you want two losses
+    MAX_CONSECUTIVE_LOSSES = 1
 
     def check_pause():
         nonlocal execution_paused
 
-        # Only consider CLOSED signals
         closed = [
             sig for sig in processed_signals
             if sig.get("outcome") in ("win", "loss")
@@ -1245,32 +1241,25 @@ def trading_loop():
         if not closed:
             return
 
-        # --- CRITICAL FIX ---
-        # Sort by EXECUTION TIME, not list order
         closed_sorted = sorted(
             closed,
             key=lambda x: x["time"],
             reverse=True
         )
 
-        # Get most recent executed signals
         recent = closed_sorted[:MAX_CONSECUTIVE_LOSSES]
 
         if not recent:
             return
 
-        # =============================
-        # RESUME CONDITION
-        # =============================
+        # RESUME
         if execution_paused:
             if recent[0]["outcome"] == "win":
                 execution_paused = False
                 logging.info("Execution resumed ✅")
             return
 
-        # =============================
-        # PAUSE CONDITION
-        # =============================
+        # PAUSE
         if (
             len(recent) == MAX_CONSECUTIVE_LOSSES
             and all(sig["outcome"] == "loss" for sig in recent)
@@ -1280,9 +1269,6 @@ def trading_loop():
                 f"Execution paused due to {MAX_CONSECUTIVE_LOSSES} consecutive losses ❌"
             )
 
-    # =============================
-    # MAIN LOOP
-    # =============================
     while True:
         try:
             for symbol in symbols:
@@ -1313,11 +1299,6 @@ def trading_loop():
                 if "signal_accepted" not in df.columns:
                     continue
 
-                previous_accepted_count = len(
-                    [sig for sig in processed_signals
-                     if sig["symbol"] == symbol and sig.get("pattern_id")]
-                )
-
                 accepted = df[df["signal_accepted"] == True].copy()
                 logging.info(f"{symbol} accepted signals count: {len(accepted)}")
 
@@ -1347,14 +1328,20 @@ def trading_loop():
                     logging.info(f"{symbol} startup sync complete")
                     continue
 
-                # =============================
-                # CHECK PAUSE STATE (FIXED)
-                # =============================
+                # =====================================
+                # ✅ EVALUATE OUTCOMES FIRST (FIXED)
+                # =====================================
+                for sig in processed_signals:
+                    check_signal_outcome(df, sig)
+
+                # =====================================
+                # ✅ NOW CHECK PAUSE STATE
+                # =====================================
                 check_pause()
 
-                # =============================
+                # =====================================
                 # PROCESS SIGNALS
-                # =============================
+                # =====================================
                 for _, row in accepted.iterrows():
                     sig_id = (symbol, row["time"], row.get("direction"))
 
@@ -1386,7 +1373,7 @@ def trading_loop():
 
                     if open_positions >= 3:
                         logging.info(
-                            f"MT5 ACCOUNT LIMIT REACHED ({open_positions} open positions) — "
+                            f"MT5 ACCOUNT LIMIT REACHED ({open_positions}) — "
                             f"Signal logged but trade blocked at {row['time']}"
                         )
                         continue
@@ -1399,7 +1386,7 @@ def trading_loop():
 
                     try:
                         volume = calculate_volume(
-                            entry, sl, symbol, risk_pct=0.10
+                            entry, sl, symbol, risk_pct=0.05
                         )
                     except Exception as e:
                         volume = 0.01
@@ -1427,22 +1414,9 @@ def trading_loop():
                     else:
                         logging.warning("TRADE FAILED ❌")
 
-                new_accepted_count = len(
-                    [sig for sig in processed_signals
-                     if sig["symbol"] == symbol and sig.get("pattern_id")]
-                )
-                if new_accepted_count > previous_accepted_count:
-                    logging.info(
-                        f"{symbol} NEW signals added to analytics: "
-                        f"{new_accepted_count - previous_accepted_count}"
-                    )
-
-                # =============================
-                # EVALUATE OUTCOMES
-                # =============================
-                for sig in processed_signals:
-                    check_signal_outcome(df, sig)
-
+                # =====================================
+                # LOG STATS (after stable state)
+                # =====================================
                 print_win_loss_sequence(processed_signals, last_n=5000)
                 update_win_rate()
 
