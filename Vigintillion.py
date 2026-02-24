@@ -1236,28 +1236,44 @@ def trading_loop():
     def check_pause():
         nonlocal execution_paused
 
-        # Only look at CLOSED outcomes
+        # Only consider CLOSED signals
         closed = [
-            sig["outcome"]
-            for sig in reversed(processed_signals)
+            sig for sig in processed_signals
             if sig.get("outcome") in ("win", "loss")
         ]
+
         if not closed:
             return
 
-        recent = closed[:MAX_CONSECUTIVE_LOSSES]
+        # --- CRITICAL FIX ---
+        # Sort by EXECUTION TIME, not list order
+        closed_sorted = sorted(
+            closed,
+            key=lambda x: x["time"],
+            reverse=True
+        )
 
-        # --- RESUME CONDITION ---
+        # Get most recent executed signals
+        recent = closed_sorted[:MAX_CONSECUTIVE_LOSSES]
+
+        if not recent:
+            return
+
+        # =============================
+        # RESUME CONDITION
+        # =============================
         if execution_paused:
-            if recent and recent[0] == "win":
+            if recent[0]["outcome"] == "win":
                 execution_paused = False
                 logging.info("Execution resumed ✅")
             return
 
-        # --- PAUSE CONDITION ---
+        # =============================
+        # PAUSE CONDITION
+        # =============================
         if (
             len(recent) == MAX_CONSECUTIVE_LOSSES
-            and all(o == "loss" for o in recent)
+            and all(sig["outcome"] == "loss" for sig in recent)
         ):
             execution_paused = True
             logging.info(
@@ -1271,9 +1287,6 @@ def trading_loop():
         try:
             for symbol in symbols:
 
-                # =============================
-                # SYMBOL CHECK
-                # =============================
                 info = mt5.symbol_info(symbol)
                 if not info:
                     logging.error(f"{symbol} symbol_info None")
@@ -1282,18 +1295,12 @@ def trading_loop():
                 if not info.visible:
                     mt5.symbol_select(symbol, True)
 
-                # =============================
-                # FETCH DATA
-                # =============================
                 df = fetch_data(symbol, csv_path="USDJPY_M15.csv")
                 if df is None or len(df) < 3:
                     continue
 
                 df = df.iloc[:-1].copy()
 
-                # =============================
-                # SIGNAL PIPELINE (UNCHANGED)
-                # =============================
                 df = generate_core_signals(df)
                 df = apply_trap_mapping(df)
                 df = apply_liquidity_filter(df)
@@ -1306,8 +1313,10 @@ def trading_loop():
                 if "signal_accepted" not in df.columns:
                     continue
 
-                # --- NEW: track previous accepted count ---
-                previous_accepted_count = len([sig for sig in processed_signals if sig["symbol"]==symbol and sig.get("pattern_id")])
+                previous_accepted_count = len(
+                    [sig for sig in processed_signals
+                     if sig["symbol"] == symbol and sig.get("pattern_id")]
+                )
 
                 accepted = df[df["signal_accepted"] == True].copy()
                 logging.info(f"{symbol} accepted signals count: {len(accepted)}")
@@ -1339,7 +1348,7 @@ def trading_loop():
                     continue
 
                 # =============================
-                # CHECK PAUSE STATE
+                # CHECK PAUSE STATE (FIXED)
                 # =============================
                 check_pause()
 
@@ -1349,7 +1358,6 @@ def trading_loop():
                 for _, row in accepted.iterrows():
                     sig_id = (symbol, row["time"], row.get("direction"))
 
-                    # Prevent duplicate signal logging
                     if sig_id in traded_signals:
                         continue
 
@@ -1359,9 +1367,6 @@ def trading_loop():
                     direction = row.get("direction")
                     pid = row.get("pattern_id")
 
-                    # ----------------------------------
-                    # ALWAYS LOG SIGNAL (CRITICAL FIX)
-                    # ----------------------------------
                     processed_signals.append({
                         "symbol": symbol,
                         "time": row["time"],
@@ -1376,11 +1381,6 @@ def trading_loop():
 
                     traded_signals.add(sig_id)
 
-                    # ----------------------------------
-                    # EXECUTION LAYER ONLY
-                    # ----------------------------------
-
-                    # --- HARD MT5 ACCOUNT POSITION CHECK ---
                     positions = mt5.positions_get()
                     open_positions = len(positions) if positions else 0
 
@@ -1389,7 +1389,7 @@ def trading_loop():
                             f"MT5 ACCOUNT LIMIT REACHED ({open_positions} open positions) — "
                             f"Signal logged but trade blocked at {row['time']}"
                         )
-                        continue  # DO NOT TRADE, DO NOT RETRY LATER
+                        continue
 
                     if execution_paused:
                         logging.info(
@@ -1399,7 +1399,7 @@ def trading_loop():
 
                     try:
                         volume = calculate_volume(
-                            entry, sl, symbol, risk_pct=0.05
+                            entry, sl, symbol, risk_pct=0.10
                         )
                     except Exception as e:
                         volume = 0.01
@@ -1426,10 +1426,16 @@ def trading_loop():
                         logging.info("TRADE FIRED ✅")
                     else:
                         logging.warning("TRADE FAILED ❌")
-                # --- NEW: refresh accepted count for analytics immediately ---
-                new_accepted_count = len([sig for sig in processed_signals if sig["symbol"]==symbol and sig.get("pattern_id")])
+
+                new_accepted_count = len(
+                    [sig for sig in processed_signals
+                     if sig["symbol"] == symbol and sig.get("pattern_id")]
+                )
                 if new_accepted_count > previous_accepted_count:
-                    logging.info(f"{symbol} NEW signals added to analytics: {new_accepted_count - previous_accepted_count}")
+                    logging.info(
+                        f"{symbol} NEW signals added to analytics: "
+                        f"{new_accepted_count - previous_accepted_count}"
+                    )
 
                 # =============================
                 # EVALUATE OUTCOMES
@@ -1437,9 +1443,6 @@ def trading_loop():
                 for sig in processed_signals:
                     check_signal_outcome(df, sig)
 
-                # =============================
-                # LOG STATS
-                # =============================
                 print_win_loss_sequence(processed_signals, last_n=5000)
                 update_win_rate()
 
