@@ -61,7 +61,7 @@ symbols = ["USDJPY"]
 lot_step = 0.01
 
 slippage = 3
-magic_number = 45650708  # Unique identifier for the Undecillion engine
+magic_number = 20257008  # Unique identifier for the Undecillion engine
 timezone_offset = -5  # Jamaica timezone is UTC-5
 
 session_times = {
@@ -274,48 +274,103 @@ def generate_core_signals(df):
     pre_signal_bias = pd.Series([None]*n, index=df.index, dtype=object)
     pattern_id = pd.Series([None]*n, index=df.index, dtype=object)
     # ==============================
-    # 2-CANDLE BULL CONTINUATION — Raw Pattern
+    # Pin Accumulation — Buy (Pattern_E)
+    # ==============================
+    # ==============================
+    # Pin Accumulation — Buy (Pattern_E)
     # ==============================
 
-    # ---- Configurable Variables ----
-    PIP_VALUE = 0.01  # USDJPY
-    SL_PAD_PIPS = 15  # SL pad in pips
-    RISK_TO_REWARD = 1.0  # TP relative to SL
-    RANGE_FRACTION = 1  # optional multiplier for the combined range
+    # ---- Tunable Parameters ----
+    VOL_MULT = 1.0
+    SL_BUFFER = 2.3
+    TP_R_MULT = 1
+    decimals = 3
 
-    # ---- Raw 2-candle continuation logic ----
-    for i in range(2, len(df)):
+    # --- Body % Filters ---
+    MIN_BODY_RATIO = 0.2
+    MAX_BODY_RATIO = 0.9
 
-        c1 = df.iloc[i - 2]
-        c2 = df.iloc[i - 1]
-        c_entry = df.iloc[i]
+    # --- Bull–Bear Regime Filter ---
+    REGIME_LOOKBACK = 20
+    BULL_THRESHOLD = 0.3
 
-        # ---- Check two consecutive bullish candles ----
-        if not (c1['close'] > c1['open'] and c2['close'] > c2['open']):
+    # ---- Volume ----
+    vol_avg = df['volume'].rolling(20).mean()
+
+    # ---- Body vs Total Range ----
+    body_size = (df['close'] - df['open']).abs()
+    total_range = (df['high'] - df['low'])
+
+    # Avoid divide-by-zero
+    body_ratio = body_size / total_range.replace(0, float('nan'))
+
+    body_cond = (
+            (body_ratio >= MIN_BODY_RATIO) &
+            (body_ratio <= MAX_BODY_RATIO)
+    )
+
+    # ---- Pattern Conditions ----
+    cond_lows = (
+            (df['low'] > df['low'].shift(1)) &
+            (df['low'].shift(1) > df['low'].shift(2))
+    )
+
+    cond_bulls = (
+            (df['close'] > df['open']) &
+            (df['close'].shift(1) > df['open'].shift(1)) &
+            (df['close'].shift(2) > df['open'].shift(2))
+    )
+
+    vol_cond = df['volume'] > vol_avg * VOL_MULT
+
+    # ==============================
+    # Bull–Bear Ratio Regime Logic
+    # ==============================
+
+    bull_candles = (df['close'] > df['open']).astype(int)
+    bear_candles = (df['close'] < df['open']).astype(int)
+
+    bull_count = bull_candles.rolling(REGIME_LOOKBACK).sum()
+    bear_count = bear_candles.rolling(REGIME_LOOKBACK).sum()
+
+    bull_bear_ratio = bull_count / (bull_count + bear_count)
+
+    regime_cond = bull_bear_ratio >= BULL_THRESHOLD
+
+    # ---- Combined Mask ----
+    mask = (
+            cond_lows &
+            cond_bulls &
+            vol_cond &
+            body_cond &
+            regime_cond
+    ).fillna(False)
+
+    # ---- Write Signals ----
+    for idx in mask[mask].index:
+
+        entry = float(df.at[idx, 'close'])
+
+        ref_low = float(df['low'].shift(2).at[idx])
+        sl_val = ref_low - SL_BUFFER
+
+        risk = entry - sl_val
+        if risk <= 0:
             continue
 
-        # ---- Entry ----
-        entry = c_entry['close']
+        tp_val = entry + TP_R_MULT * risk
 
-        # ---- Compute combined range of the two candles ----
-        combined_low = min(c1['low'], c2['low'])
-        combined_high = max(c1['high'], c2['high'])
-        combined_range = combined_high - combined_low
+        signal_flag.at[idx] = 1
+        direction.at[idx] = "buy"
+        entry_price.at[idx] = entry
+        sl.at[idx] = round(sl_val, decimals)
+        tp.at[idx] = round(tp_val, decimals)
 
-        # ---- SL/TP ----
-        sl_val = combined_low - (SL_PAD_PIPS * PIP_VALUE)  # SL pad below the two-candle low
-        tp_val = entry + (entry - sl_val) * RISK_TO_REWARD  # TP scales to maintain R:R
+        signal_reason.at[idx] = "Pin Accumulation"
+        pattern_build_score.at[idx] = 1.8
+        pre_signal_bias.at[idx] = "buy"
+        pattern_id.at[idx] = "Pattern_E"
 
-        # ---- Write signals ----
-        signal_flag.at[i] = 1
-        direction.at[i] = "buy"
-        entry_price.at[i] = entry
-        sl.at[i] = round(sl_val, 3)
-        tp.at[i] = round(tp_val, 3)
-        signal_reason.at[i] = "2-Candle Bull Continuation"
-        pattern_build_score.at[i] = 1.0
-        pre_signal_bias.at[i] = "buy"
-        pattern_id.at[i] = "BULL_CONT_2C"
     # -----------------------
     # Commit results
     df['signal_flag'] = signal_flag
@@ -473,7 +528,7 @@ def apply_liquidity_filter(df):
         df.at[idx, "liquidity_reject"] = proximity_score >= 0.7
     # === Long-Term Ceiling Protection ===
     long_lookback = 1000  # bars to consider for multi-month high
-    ceiling_threshold = 0.005  # price distance threshold (adjust to your symbol precision)
+    ceiling_threshold = 0.0005  # price distance threshold (adjust to your symbol precision)
 
     for i in range(lookback_range, len(df)):
         idx = df.index[i]
@@ -542,7 +597,7 @@ def apply_mvrf_filter(df):
     df["mvrf_reject"] = False
 
     lookback = 6
-    body_threshold = 0.5
+    body_threshold = 0.25
     wick_threshold = 0.55
     volatility_spike_multiplier = 1.6
     max_allowed_anomalies = 3
@@ -747,7 +802,7 @@ def safe_str(val, fmt=None):
     return str(val)
 
 
-def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.05):
+def calculate_volume(entry_price, sl_price, symbol, risk_pct=0.1):
     account_info = mt5.account_info()
     symbol_info = mt5.symbol_info(symbol)
 
@@ -925,7 +980,7 @@ def fetch_data(symbol, csv_path=None):
     import MetaTrader5 as mt5
     from datetime import timedelta
 
-    MAX_CANDLES = 1500  # keep fixed length/*-+
+    MAX_CANDLES = 8000  # keep fixed length/*-+
 
 
     # =========================
