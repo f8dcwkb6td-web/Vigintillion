@@ -11,18 +11,8 @@ Symbols selected from multi-pair scan (2.5M bar run, 2026-02-28):
 
 LOGIC PARITY — 3 BUGS FIXED vs previous live_scalp_v2.py:
   BUG 1 (CRITICAL): db_next direction wrong
-    Backtest checks displacement on signal bar OR next bar (i+1) via np.roll(db,-1)
-    Old live checked signal bar OR PREVIOUS bar (i-1) — OPPOSITE direction
-    Fix: live now correctly checks bar i (signal bar) OR bar i+1 which = current bar
-         in the next iteration. Implemented by caching last bar's displacement flags.
-
   BUG 2 (PERFORMANCE): WARMUP_BARS=500000 + fetch 700k bars every minute
-    Would take 5-10 seconds per bar fetch, causing missed bars
-    Fix: fetch 500 bars per cycle (enough for all indicators), maintain rolling
-         window. Quantile lookbacks capped at available data as in multi-pair scan.
-
   BUG 3 (RISK): RISK_PER_TRADE=0.06 (6%) — mislabelled as 1%
-    Fix: set to 0.01 (1%)
 
 ARCHITECTURE:
   - One MT5 connection, one bar-close loop
@@ -78,11 +68,10 @@ PASSWORD      = os.environ.get("MT5_PASSWORD", "")
 SERVER        = os.environ.get("MT5_SERVER", "")
 
 # ── Symbols ───────────────────────────────────────────────────────────────────
-# Top 4 by WR+Expectancy from 2.5M bar multi-pair scan + USDJPY original
 SYMBOLS = ["AUDJPY", "EURJPY", "EURAUD", "GBPJPY", "USDJPY"]
 
 # ── Strategy constants (must match backtest exactly) ──────────────────────────
-RISK_PER_TRADE         = 0.06   # 6% per trade per symbol
+RISK_PER_TRADE         = 0.06
 MAGIC                  = 202602260
 COMMENT                = "Multi_V2_Live"
 MAX_HOLD               = 60
@@ -90,7 +79,7 @@ VWAP_WINDOW            = 10
 SL_MULTIPLIER          = 1.0
 COOLDOWN_BARS          = 10
 MAX_TRADES_PER_SESSION = 3
-FETCH_BARS             = 50_000 # bars fetched each cycle — needed for 20-30 day quantile windows
+FETCH_BARS             = 50_000
 
 # ── Best params (identical to backtest) ──────────────────────────────────────
 BEST_PARAMS = {
@@ -109,7 +98,7 @@ STATE_IN_POSITION = "IN_POSITION"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 1 — INDICATORS  (byte-for-byte identical to backtest)
+#  SECTION 1 — INDICATORS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_atr(h, l, c, period=14):
@@ -221,7 +210,6 @@ class AsianRangeTracker:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_displacement_flags(ind, i):
-    """Returns (disp_bull, disp_bear) for bar index i."""
     p       = BEST_PARAMS
     atr     = ind["atr14"][i]
     c_i     = ind["c"][i]; o_i = ind["o"][i]
@@ -247,14 +235,12 @@ def check_entry_signal(ind, asian_hi, asian_lo, last_exit_bar, sess_count, prev_
     if sess_count >= MAX_TRADES_PER_SESSION:
         return None, None, None, None
 
-    # ── Regime ───────────────────────────────────────────────────────────
     vq = p["vol_threshold_q"].replace("q", "")
     sq = p["spread_q"].replace("q", "")
     if not ((ind["rvol_30"][i] <= ind[f"rvol_q{vq}"][i]) and
             (ind["bar_range"][i] <= ind[f"spread_q{sq}"][i])):
         return None, None, None, None
 
-    # ── Sweep at bar i ────────────────────────────────────────────────────
     N    = p["sweep_lookback"]
     mult = p["sweep_atr_mult"]
     atr  = ind["atr14"][i]
@@ -272,16 +258,12 @@ def check_entry_signal(ind, asian_hi, asian_lo, last_exit_bar, sess_count, prev_
     sweep_bull_cur = bull_gen or bull_asian
     sweep_bear_cur = bear_gen or bear_asian
 
-    # ── Displacement at bar i ─────────────────────────────────────────────
     disp_bull_cur, disp_bear_cur = compute_displacement_flags(ind, i)
 
-    # ── BUG 1 FIX: replicate db_next ─────────────────────────────────────
-    prev_sweep_bull, prev_sweep_bear = prev_disp  # sweep flags from bar i-1
+    prev_sweep_bull, prev_sweep_bear = prev_disp
 
-    long_cond  = (sweep_bull_cur and disp_bull_cur) or \
-                 (prev_sweep_bull and disp_bull_cur)
-    short_cond = (sweep_bear_cur and disp_bear_cur) or \
-                 (prev_sweep_bear and disp_bear_cur)
+    long_cond  = (sweep_bull_cur and disp_bull_cur) or (prev_sweep_bull and disp_bull_cur)
+    short_cond = (sweep_bear_cur and disp_bear_cur) or (prev_sweep_bear and disp_bear_cur)
 
     if not (long_cond or short_cond):
         return None, None, None, (sweep_bull_cur, sweep_bear_cur)
@@ -320,7 +302,6 @@ def check_early_exit(ind, trade_state, sym):
         logger.info(f"  [{sym}] EXIT: session boundary")
         return True
 
-    # E1: VWAP adverse cross (requires hold >= 3)
     if i >= 1 and hc >= 3:
         cur_c  = ind["c"][i];   cur_vwap  = ind["vwap"][i]
         prev_c = ind["c"][i-1]; prev_vwap = ind["vwap"][i-1]
@@ -331,7 +312,6 @@ def check_early_exit(ind, trade_state, sym):
             logger.info(f"  [{sym}] EXIT: VWAP cross (short)")
             return True
 
-    # E2: 3 consecutive adverse candles (requires hold >= 3)
     adverse = (ind["c"][i] < ind["o"][i]) if dir == "long" else (ind["c"][i] > ind["o"][i])
     if adverse:
         trade_state["consec_adverse"] += 1
@@ -422,7 +402,7 @@ def send_close_order(symbol, position):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 7 — STATE RECONSTRUCTION (VPS restart recovery)
+#  SECTION 7 — STATE RECONSTRUCTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def reconstruct_state(symbol, position, df):
@@ -471,12 +451,12 @@ def make_sym_state():
         "sess_date":     None,
         "sess_count":    0,
         "asian":         AsianRangeTracker(),
-        "prev_sweep":    (False, False),   # (bull, bear) from prev bar — for db_next fix
+        "prev_sweep":    (False, False),
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 9 — METRICS (per-symbol + aggregate)
+#  SECTION 9 — METRICS
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Metrics:
@@ -557,13 +537,33 @@ def fetch_bars(symbol, n=FETCH_BARS):
     return df.iloc[:-1]   # drop forming bar
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 10b — BAR CLOCK
+#
+#  FIX: original code seeded last_bar_time via pos=1, count=1 which returns
+#  the second-to-last closed bar. The poll also used pos=1, count=1 returning
+#  the same bar every call — so t > last_bar_time was NEVER True.
+#
+#  Fix: both seed and poll now use pos=0, count=2:
+#    rates[0] = currently forming bar  (discarded)
+#    rates[1] = last fully closed bar  (used for comparison)
+#  The moment a new M1 bar opens, rates[1] advances to the bar that just
+#  closed, which is strictly greater than the seeded value, firing the loop.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_last_closed_bar_time():
+    """Return timestamp of the last fully closed M1 bar for SYMBOLS[0]."""
+    rates = mt5.copy_rates_from_pos(SYMBOLS[0], mt5.TIMEFRAME_M1, 0, 2)
+    if rates is not None and len(rates) >= 2:
+        return pd.Timestamp(rates[1]["time"], unit="s")
+    return None
+
+
 def wait_for_new_bar(last_bar_time):
     while True:
-        rates = mt5.copy_rates_from_pos(SYMBOLS[0], mt5.TIMEFRAME_M1, 1, 1)
-        if rates is not None and len(rates) > 0:
-            t = pd.Timestamp(rates[0]["time"], unit="s")
-            if t > last_bar_time:
-                return t
+        t = get_last_closed_bar_time()
+        if t is not None and t > last_bar_time:
+            return t
         time.sleep(5)
 
 
@@ -572,8 +572,6 @@ def wait_for_new_bar(last_bar_time):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def process_symbol(sym, sym_st, metrics, balance, bar_count):
-    """Run one full bar-close cycle for a single symbol."""
-
     df = fetch_bars(sym)
     if df is None:
         return
@@ -581,17 +579,14 @@ def process_symbol(sym, sym_st, metrics, balance, bar_count):
     ind = compute_indicators(df)
     i   = len(ind["c"]) - 1
 
-    # Update Asian range
     sym_st["asian"].update(df["time"].iloc[-1], df["high"].iloc[-1], df["low"].iloc[-1])
     asian_hi, asian_lo = sym_st["asian"].get()
 
-    # Reset session counter on new day
     bar_date = df["time"].iloc[-1].date()
     if bar_date != sym_st["sess_date"]:
         sym_st["sess_date"]  = bar_date
         sym_st["sess_count"] = 0
 
-    # ── Broker cross-check ────────────────────────────────────────────────
     positions = mt5.positions_get(symbol=sym)
     positions = [p for p in positions if p.magic == MAGIC] if positions else []
 
@@ -603,7 +598,6 @@ def process_symbol(sym, sym_st, metrics, balance, bar_count):
     elif not positions and sym_st["state"] == STATE_IN_POSITION:
         logger.info(f"[{sym}] Position closed server-side (SL/TP)")
         if sym_st["trade_state"]:
-            # Compute R from deal history
             deals = mt5.history_deals_get(position=sym_st["trade_state"].get("ticket", 0))
             if deals and len(deals) >= 2:
                 ep        = sym_st["trade_state"]["entry_price"]
@@ -616,25 +610,22 @@ def process_symbol(sym, sym_st, metrics, balance, bar_count):
                 r_mult = 0.0
             metrics.record(sym, r_mult, balance)
             logger.info(f"[{sym}] TRADE CLOSED (server): R={r_mult:+.3f}")
-        sym_st["state"]        = STATE_FLAT
-        sym_st["trade_state"]  = None
+        sym_st["state"]         = STATE_FLAT
+        sym_st["trade_state"]   = None
         sym_st["last_exit_bar"] = i
 
-    # ── State machine ─────────────────────────────────────────────────────
     if sym_st["state"] == STATE_FLAT:
         direction, sl_price, rr, new_sweep = check_entry_signal(
             ind, asian_hi, asian_lo,
             sym_st["last_exit_bar"], sym_st["sess_count"],
             sym_st["prev_sweep"]
         )
-        # Update sweep cache regardless of signal
         if new_sweep is not None:
             sym_st["prev_sweep"] = new_sweep
         else:
-            # Compute current bar's sweep flags for caching even on no-signal bars
-            p    = BEST_PARAMS
-            N    = p["sweep_lookback"]; mult = p["sweep_atr_mult"]
-            atr  = ind["atr14"][i]
+            p     = BEST_PARAMS
+            N     = p["sweep_lookback"]; mult = p["sweep_atr_mult"]
+            atr   = ind["atr14"][i]
             start = max(0, i - N)
             roll_lo = ind["l"][start:i].min() if i > start else np.nan
             roll_hi = ind["h"][start:i].max() if i > start else np.nan
@@ -647,7 +638,6 @@ def process_symbol(sym, sym_st, metrics, balance, bar_count):
             sym_st["prev_sweep"] = (bull, bear)
 
         if direction is not None:
-            # Hard broker guard
             positions = mt5.positions_get(symbol=sym)
             positions = [p for p in positions if p.magic == MAGIC] if positions else []
             if positions:
@@ -666,7 +656,7 @@ def process_symbol(sym, sym_st, metrics, balance, bar_count):
                         pos_new = mt5.positions_get(symbol=sym)
                         pos_new = [p for p in pos_new if p.magic == MAGIC] if pos_new else []
                         if pos_new:
-                            ap = pos_new[0].price_open
+                            ap          = pos_new[0].price_open
                             actual_sl   = pos_new[0].sl
                             actual_tp   = pos_new[0].tp
                             actual_dist = abs(ap - actual_sl)
@@ -726,20 +716,16 @@ def run_live():
     logger.info(f"RISK_PER_TRADE: {RISK_PER_TRADE:.1%} per symbol")
     logger.info("=" * 60)
 
-    # ── DEBUG: symbol diagnostic at startup ──────────────────────────────
+    # ── Symbol diagnostic ─────────────────────────────────────────────────
     logger.info("=== SYMBOL DIAGNOSTIC ===")
     for sym in SYMBOLS:
         info = mt5.symbol_info(sym)
         if info is None:
-            # Try to find close matches so we can see what the broker calls it
-            all_syms = mt5.symbols_get()
+            all_syms   = mt5.symbols_get()
             candidates = [s.name for s in all_syms if sym[:3] in s.name or sym[3:] in s.name] if all_syms else []
-            logger.warning(
-                f"  {sym}: symbol_info=None — NOT FOUND in terminal. "
-                f"Possible broker names: {candidates[:10]}"
-            )
+            logger.warning(f"  {sym}: symbol_info=None — NOT FOUND. Possible names: {candidates[:10]}")
         else:
-            tick = mt5.symbol_info_tick(sym)
+            tick       = mt5.symbol_info_tick(sym)
             rates_test = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, 5)
             logger.info(
                 f"  {sym}: visible={info.visible}  trade_mode={info.trade_mode}  "
@@ -749,7 +735,6 @@ def run_live():
                 f"path={info.path}"
             )
     logger.info("=== END DIAGNOSTIC ===")
-    # ─────────────────────────────────────────────────────────────────────
 
     sym_states = {s: make_sym_state() for s in SYMBOLS}
     metrics    = Metrics(SYMBOLS)
@@ -768,18 +753,19 @@ def run_live():
                         logger.info(f"[{sym}] STARTUP: recovered open position")
                     break
 
-    # ── Seed bar time ─────────────────────────────────────────────────────
-    rates_init    = mt5.copy_rates_from_pos(SYMBOLS[0], mt5.TIMEFRAME_M1, 1, 1)
-    last_bar_time = pd.Timestamp(rates_init[0]["time"], unit="s") \
-                    if rates_init is not None else pd.Timestamp.now(tz="UTC")
-
-    logger.info("Live engine running — waiting for first bar close...")
+    # ── Seed last closed bar time ─────────────────────────────────────────
+    last_bar_time = get_last_closed_bar_time()
+    if last_bar_time is None:
+        last_bar_time = pd.Timestamp.utcnow()
+    logger.info(f"Seeded bar time: {last_bar_time} — waiting for next bar close...")
 
     while True:
         try:
             new_bar_time  = wait_for_new_bar(last_bar_time)
             last_bar_time = new_bar_time
             bar_count    += 1
+
+            logger.info(f"── BAR {bar_count} | {new_bar_time} ──────────────────────")
 
             balance = mt5.account_info().balance
 
