@@ -90,7 +90,7 @@ VWAP_WINDOW            = 10
 SL_MULTIPLIER          = 1.0
 COOLDOWN_BARS          = 10
 MAX_TRADES_PER_SESSION = 3
-FETCH_BARS             = 60_000 # bars fetched each cycle — needed for 20-30 day quantile windows
+FETCH_BARS             = 50_000 # bars fetched each cycle — needed for 20-30 day quantile windows
 
 # ── Best params (identical to backtest) ──────────────────────────────────────
 BEST_PARAMS = {
@@ -218,14 +218,6 @@ class AsianRangeTracker:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 4 — SIGNAL DETECTION
-#
-#  BUG 1 FIX: db_next direction
-#  Backtest uses np.roll(db, -1) which shifts the displacement array LEFT by 1,
-#  meaning signal[i] can fire if displacement is TRUE at bar i OR bar i+1.
-#  In live trading, when we evaluate bar i (the just-closed bar = signal bar),
-#  bar i+1 has NOT closed yet. So we CACHE bar i's displacement flags and on
-#  the NEXT bar evaluation, we check: did prev bar have a sweep? + does current
-#  OR prev bar have displacement? This correctly replicates db_next behaviour.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_displacement_flags(ind, i):
@@ -243,44 +235,6 @@ def compute_displacement_flags(ind, i):
 
 
 def check_entry_signal(ind, asian_hi, asian_lo, last_exit_bar, sess_count, prev_disp):
-    """
-    Evaluate signal on bar index -1 (most recent closed bar).
-
-    prev_disp: (disp_bull, disp_bear) from the PREVIOUS bar — needed for db_next parity.
-    Signal fires if: sweep(i) AND (disp(i) OR disp(i-1))
-    This matches backtest: signal[i] = sweep[i] & (db[i] | db[i+1])
-    where db[i+1] in backtest == disp of the bar AFTER signal bar
-    == disp of the bar that IS the current bar when we evaluate next bar's signal.
-
-    Wait — let's be precise:
-      Backtest signal array index = i means: close of bar i triggered the signal,
-      entry is at bar i+1 open.
-      db[i] = displacement at bar i
-      db_next[i] = db[i+1] = displacement at bar i+1
-
-    In live, when we evaluate bar i (just closed):
-      We check sweep at bar i
-      We check disp at bar i (= db[i]) ✓
-      We check disp at bar i-1 — that is db[i-1], NOT db[i+1]  ← OLD BUG
-
-    Correct live implementation:
-      On bar i, we can only check db[i] and db[i-1].
-      db[i+1] is not closed yet.
-
-    Resolution: the backtest signal "db | db_next" means the displacement can
-    occur on the same bar as the sweep OR the bar immediately after.
-    In live, when bar i closes with a sweep, we fire a signal.
-    We then check: displacement exists at bar i OR at bar i-1 (prev bar).
-    This is a one-bar lag approximation.
-
-    A BETTER approximation: fire signal if sweep at bar i AND disp at bar i.
-    Then ALSO fire if sweep was at bar i-1 (cached) AND disp at bar i.
-    This correctly replicates "sweep bar i has displacement at i or i+1":
-      Case 1: sweep[i] & disp[i]  → entry next bar ✓
-      Case 2: sweep[i-1] & disp[i] → in backtest this fires as db_next on bar i-1 ✓
-
-    This is the correct fix and is implemented below.
-    """
     i  = len(ind["c"]) - 1
     p  = BEST_PARAMS
 
@@ -322,9 +276,6 @@ def check_entry_signal(ind, asian_hi, asian_lo, last_exit_bar, sess_count, prev_
     disp_bull_cur, disp_bear_cur = compute_displacement_flags(ind, i)
 
     # ── BUG 1 FIX: replicate db_next ─────────────────────────────────────
-    # Case 1: sweep AND disp both on current bar i
-    # Case 2: sweep was on prev bar (i-1) AND disp is on current bar i
-    #         (prev_disp contains sweep flags from bar i-1, passed in from sym state)
     prev_sweep_bull, prev_sweep_bear = prev_disp  # sweep flags from bar i-1
 
     long_cond  = (sweep_bull_cur and disp_bull_cur) or \
@@ -333,7 +284,6 @@ def check_entry_signal(ind, asian_hi, asian_lo, last_exit_bar, sess_count, prev_
                  (prev_sweep_bear and disp_bear_cur)
 
     if not (long_cond or short_cond):
-        # Return sweep flags for this bar so next bar can use them
         return None, None, None, (sweep_bull_cur, sweep_bear_cur)
 
     if long_cond and short_cond:
@@ -584,7 +534,20 @@ class Metrics:
 def fetch_bars(symbol, n=FETCH_BARS):
     rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, n + 1)
     if rates is None:
-        logger.warning(f"[{symbol}] fetch returned None — {mt5.last_error()}")
+        err  = mt5.last_error()
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            info_str = "symbol_info=None (symbol unknown to terminal)"
+        else:
+            info_str = (
+                f"visible={info.visible}  trade_mode={info.trade_mode}  "
+                f"spread={info.spread}  digits={info.digits}  "
+                f"path={info.path}"
+            )
+        logger.warning(
+            f"[{symbol}] fetch returned None — "
+            f"error=({err[0]}, '{err[1]}') | {info_str}"
+        )
         return None
     if len(rates) < 50:
         logger.warning(f"[{symbol}] only {len(rates)} bars")
@@ -762,6 +725,31 @@ def run_live():
     logger.info(f"BEST_PARAMS: {BEST_PARAMS}")
     logger.info(f"RISK_PER_TRADE: {RISK_PER_TRADE:.1%} per symbol")
     logger.info("=" * 60)
+
+    # ── DEBUG: symbol diagnostic at startup ──────────────────────────────
+    logger.info("=== SYMBOL DIAGNOSTIC ===")
+    for sym in SYMBOLS:
+        info = mt5.symbol_info(sym)
+        if info is None:
+            # Try to find close matches so we can see what the broker calls it
+            all_syms = mt5.symbols_get()
+            candidates = [s.name for s in all_syms if sym[:3] in s.name or sym[3:] in s.name] if all_syms else []
+            logger.warning(
+                f"  {sym}: symbol_info=None — NOT FOUND in terminal. "
+                f"Possible broker names: {candidates[:10]}"
+            )
+        else:
+            tick = mt5.symbol_info_tick(sym)
+            rates_test = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, 5)
+            logger.info(
+                f"  {sym}: visible={info.visible}  trade_mode={info.trade_mode}  "
+                f"spread={info.spread}  digits={info.digits}  "
+                f"tick={'OK' if tick else 'None'}  "
+                f"bars_test={'OK len='+str(len(rates_test)) if rates_test is not None else 'None — '+str(mt5.last_error())}  "
+                f"path={info.path}"
+            )
+    logger.info("=== END DIAGNOSTIC ===")
+    # ─────────────────────────────────────────────────────────────────────
 
     sym_states = {s: make_sym_state() for s in SYMBOLS}
     metrics    = Metrics(SYMBOLS)
