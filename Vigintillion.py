@@ -78,7 +78,7 @@ MAX_HOLD               = 60
 VWAP_WINDOW            = 10
 SL_MULTIPLIER          = 1.0
 COOLDOWN_BARS          = 10
-MAX_TRADES_PER_SESSION = 3
+MAX_TRADES_PER_SESSION = 6
 FETCH_BARS             = 50_000
 
 # ── Best params (identical to backtest) ──────────────────────────────────────
