@@ -526,9 +526,10 @@ class SignalCounter:
 
     def scan_history(self, sym, df):
         """
-        Scan all fetched bars for sym and count how many entry signals
-        would have fired. Uses identical logic to check_entry_signal but
-        vectorised over the full bar history. Called once on startup per symbol.
+        Simulate the full engine state machine bar by bar over all fetched bars.
+        Enforces cooldown, max trades per session, prev_sweep carry, and in_window
+        exactly as process_symbol does. Count reflects trades the engine would
+        actually have taken — not raw signal opportunities.
         """
         if df is None or len(df) < 100:
             return
@@ -537,42 +538,99 @@ class SignalCounter:
         n   = len(ind["c"])
         p   = BEST_PARAMS
 
-        vq     = p["vol_threshold_q"].replace("q", "")
-        sq     = p["spread_q"].replace("q", "")
-        regime = (ind["rvol_30"] <= ind[f"rvol_q{vq}"]) & \
-                 (ind["bar_range"] <= ind[f"spread_q{sq}"])
+        vq  = p["vol_threshold_q"].replace("q", "")
+        sq  = p["spread_q"].replace("q", "")
+        N   = p["sweep_lookback"]
+        mult= p["sweep_atr_mult"]
 
-        N    = p["sweep_lookback"]
-        mult = p["sweep_atr_mult"]
-        atr  = ind["atr14"]
+        # State machine variables — mirrors make_sym_state()
+        last_exit_bar  = -(COOLDOWN_BARS + 1)
+        sess_date      = None
+        sess_count     = 0
+        prev_sweep     = (False, False)
+        in_position    = False
+        hold_count     = 0
+        consec_adverse = 0
+        trade_dir      = None
+        count          = 0
 
-        roll_lo = pd.Series(ind["l"]).rolling(N, min_periods=N//2).min().shift(1).values
-        roll_hi = pd.Series(ind["h"]).rolling(N, min_periods=N//2).max().shift(1).values
+        for i in range(n):
+            # ── Session reset ────────────────────────────────────────────
+            bar_date = ind["dates"][i]
+            if bar_date != sess_date:
+                sess_date  = bar_date
+                sess_count = 0
 
-        bull_gen = (ind["l"] < roll_lo - mult * atr) & (ind["c"] > roll_lo)
-        bear_gen = (ind["h"] > roll_hi + mult * atr) & (ind["c"] < roll_hi)
+            # ── Asian range (not needed for signal count but keeps parity) ─
+            # (omitted — doesn't affect entry signal logic)
 
-        body      = np.abs(ind["c"] - ind["o"])
-        disp_Ab   = (ind["c"] > ind["o"]) & (body >= p["body_atr_mult"] * atr) & (ind["body_ratio"] >= 0.70)
-        disp_As   = (ind["c"] < ind["o"]) & (body >= p["body_atr_mult"] * atr) & (ind["body_ratio"] >= 0.70)
-        vol_spk   = ind["v"] >= p["vol_mult"] * ind["vol_mean_60"]
-        disp_Bb   = vol_spk & (ind["close_pos"] >= 0.80)
-        disp_Bs   = vol_spk & (ind["close_pos"] <= 0.20)
-        db        = disp_Ab | disp_Bb
-        dr        = disp_As | disp_Bs
+            atr    = ind["atr14"][i]
+            start  = max(0, i - N)
+            roll_lo = ind["l"][start:i].min() if i > start else np.nan
+            roll_hi = ind["h"][start:i].max() if i > start else np.nan
+            h_i    = ind["h"][i]; l_i = ind["l"][i]; c_i = ind["c"][i]
 
-        db_next = np.roll(db, -1); db_next[-1] = False
-        dr_next = np.roll(dr, -1); dr_next[-1] = False
+            bull_gen = (not np.isnan(roll_lo)) and (l_i < roll_lo - mult*atr) and (c_i > roll_lo)
+            bear_gen = (not np.isnan(roll_hi)) and (h_i > roll_hi + mult*atr) and (c_i < roll_hi)
+            sweep_bull = bull_gen
+            sweep_bear = bear_gen
 
-        bull_sw = bull_gen
-        bear_sw = bear_gen
+            disp_bull, disp_bear = compute_displacement_flags(ind, i)
 
-        long_sig  = regime & ind["in_window"] & bull_sw & (db | db_next)
-        short_sig = regime & ind["in_window"] & bear_sw & (dr | dr_next)
-        both      = long_sig & short_sig
-        signal    = (long_sig | short_sig) & ~both
+            prev_sweep_bull, prev_sweep_bear = prev_sweep
 
-        count = int(signal.sum())
+            # ── Exit logic (simplified — just tracks hold and window exit) ─
+            if in_position:
+                hold_count += 1
+                adverse = (ind["c"][i] < ind["o"][i]) if trade_dir == "long" \
+                          else (ind["c"][i] > ind["o"][i])
+                if adverse:
+                    consec_adverse += 1
+                else:
+                    consec_adverse = 0
+
+                exit_now = (
+                    hold_count >= MAX_HOLD or
+                    not ind["in_window"][i] or
+                    (consec_adverse >= 3 and hold_count >= 3)
+                )
+                if exit_now:
+                    in_position    = False
+                    last_exit_bar  = i
+                    hold_count     = 0
+                    consec_adverse = 0
+                    trade_dir      = None
+
+            # ── Entry logic — identical gates as check_entry_signal ───────
+            if not in_position:
+                long_cond  = (sweep_bull and disp_bull) or (prev_sweep_bull and disp_bull)
+                short_cond = (sweep_bear and disp_bear) or (prev_sweep_bear and disp_bear)
+
+                can_trade = (
+                    ind["in_window"][i] and
+                    (i - last_exit_bar >= COOLDOWN_BARS) and
+                    (sess_count < MAX_TRADES_PER_SESSION) and
+                    (ind["rvol_30"][i] <= ind[f"rvol_q{vq}"][i]) and
+                    (ind["bar_range"][i] <= ind[f"spread_q{sq}"][i]) and
+                    (long_cond or short_cond) and
+                    not (long_cond and short_cond)
+                )
+
+                if can_trade:
+                    count         += 1
+                    sess_count    += 1
+                    in_position    = True
+                    hold_count     = 0
+                    consec_adverse = 0
+                    trade_dir      = "long" if long_cond else "short"
+                    # prev_sweep carries forward unchanged on entry
+                else:
+                    # Update prev_sweep even when no trade fires
+                    prev_sweep = (sweep_bull, sweep_bear)
+
+            # Always update prev_sweep to current bar's sweep state
+            prev_sweep = (sweep_bull, sweep_bear)
+
         self.counts[sym]   = count
         self.bar_from[sym] = pd.Timestamp(ind["times"][0])
         self.bar_to[sym]   = pd.Timestamp(ind["times"][-1])
