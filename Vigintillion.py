@@ -508,6 +508,126 @@ class Metrics:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 9b — BACKTEST SIGNAL COUNTER
+#  Runs once on startup. Scans all fetched bars per symbol, counts how many
+#  signals would have fired, and reports frequency stats (point-to-point and
+#  average trades per week). Updates and re-logs every time a new live signal
+#  fires so the count stays current.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SignalCounter:
+    def __init__(self, symbols):
+        self.symbols      = symbols
+        self.counts       = {s: 0 for s in symbols}   # historical signal count from fetched bars
+        self.live_counts  = {s: 0 for s in symbols}   # live signals fired since engine start
+        self.bar_from     = {s: None for s in symbols} # earliest bar timestamp per symbol
+        self.bar_to       = {s: None for s in symbols} # latest bar timestamp per symbol
+        self.engine_start = datetime.datetime.now(datetime.timezone.utc)
+
+    def scan_history(self, sym, df):
+        """
+        Scan all fetched bars for sym and count how many entry signals
+        would have fired. Uses identical logic to check_entry_signal but
+        vectorised over the full bar history. Called once on startup per symbol.
+        """
+        if df is None or len(df) < 100:
+            return
+
+        ind = compute_indicators(df)
+        n   = len(ind["c"])
+        p   = BEST_PARAMS
+
+        vq     = p["vol_threshold_q"].replace("q", "")
+        sq     = p["spread_q"].replace("q", "")
+        regime = (ind["rvol_30"] <= ind[f"rvol_q{vq}"]) & \
+                 (ind["bar_range"] <= ind[f"spread_q{sq}"])
+
+        N    = p["sweep_lookback"]
+        mult = p["sweep_atr_mult"]
+        atr  = ind["atr14"]
+
+        roll_lo = pd.Series(ind["l"]).rolling(N, min_periods=N//2).min().shift(1).values
+        roll_hi = pd.Series(ind["h"]).rolling(N, min_periods=N//2).max().shift(1).values
+
+        bull_gen = (ind["l"] < roll_lo - mult * atr) & (ind["c"] > roll_lo)
+        bear_gen = (ind["h"] > roll_hi + mult * atr) & (ind["c"] < roll_hi)
+
+        body      = np.abs(ind["c"] - ind["o"])
+        disp_Ab   = (ind["c"] > ind["o"]) & (body >= p["body_atr_mult"] * atr) & (ind["body_ratio"] >= 0.70)
+        disp_As   = (ind["c"] < ind["o"]) & (body >= p["body_atr_mult"] * atr) & (ind["body_ratio"] >= 0.70)
+        vol_spk   = ind["v"] >= p["vol_mult"] * ind["vol_mean_60"]
+        disp_Bb   = vol_spk & (ind["close_pos"] >= 0.80)
+        disp_Bs   = vol_spk & (ind["close_pos"] <= 0.20)
+        db        = disp_Ab | disp_Bb
+        dr        = disp_As | disp_Bs
+
+        db_next = np.roll(db, -1); db_next[-1] = False
+        dr_next = np.roll(dr, -1); dr_next[-1] = False
+
+        bull_sw = bull_gen
+        bear_sw = bear_gen
+
+        long_sig  = regime & ind["in_window"] & bull_sw & (db | db_next)
+        short_sig = regime & ind["in_window"] & bear_sw & (dr | dr_next)
+        both      = long_sig & short_sig
+        signal    = (long_sig | short_sig) & ~both
+
+        count = int(signal.sum())
+        self.counts[sym]   = count
+        self.bar_from[sym] = pd.Timestamp(ind["times"][0])
+        self.bar_to[sym]   = pd.Timestamp(ind["times"][-1])
+
+    def increment_live(self, sym):
+        """Call this every time a live entry signal fires."""
+        self.live_counts[sym] += 1
+
+    def report(self):
+        """Log the full signal frequency report."""
+        sep = "=" * 65
+        logger.info(f"\n{sep}")
+        logger.info(f"[SIGNAL FREQUENCY REPORT — VIGINTILLION]")
+        logger.info(f"  Engine started : {self.engine_start.strftime('%Y-%m-%d %H:%M UTC')}")
+        logger.info(f"{'─'*65}")
+        logger.info(
+            f"  {'Symbol':<8}  {'From':<12}  {'To':<12}  "
+            f"{'Bars(hist)':>10}  {'Signals':>8}  "
+            f"{'Weeks':>6}  {'Avg/wk':>7}  {'Live':>5}"
+        )
+        logger.info(f"{'─'*65}")
+
+        total_hist  = 0
+        total_live  = 0
+
+        for sym in self.symbols:
+            hist  = self.counts[sym]
+            live  = self.live_counts[sym]
+            frm   = self.bar_from[sym]
+            to    = self.bar_to[sym]
+
+            if frm is not None and to is not None:
+                days  = max((to - frm).total_seconds() / 86400, 1)
+                weeks = days / 7.0
+                avg_w = hist / weeks if weeks > 0 else 0.0
+                frm_s = frm.strftime("%Y-%m-%d")
+                to_s  = to.strftime("%Y-%m-%d")
+            else:
+                weeks = 0.0; avg_w = 0.0
+                frm_s = "N/A"; to_s = "N/A"
+
+            logger.info(
+                f"  {sym:<8}  {frm_s:<12}  {to_s:<12}  "
+                f"{'—':>10}  {hist:>8}  "
+                f"{weeks:>6.1f}  {avg_w:>7.2f}  {live:>5}"
+            )
+            total_hist += hist
+            total_live += live
+
+        logger.info(f"{'─'*65}")
+        logger.info(f"  {'TOTAL':<8}  {'':12}  {'':12}  {'':>10}  {total_hist:>8}  {'':>6}  {'':>7}  {total_live:>5}")
+        logger.info(sep)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 10 — DATA FETCH
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -539,20 +659,9 @@ def fetch_bars(symbol, n=FETCH_BARS):
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 10b — BAR CLOCK
-#
-#  FIX: original code seeded last_bar_time via pos=1, count=1 which returns
-#  the second-to-last closed bar. The poll also used pos=1, count=1 returning
-#  the same bar every call — so t > last_bar_time was NEVER True.
-#
-#  Fix: both seed and poll now use pos=0, count=2:
-#    rates[0] = currently forming bar  (discarded)
-#    rates[1] = last fully closed bar  (used for comparison)
-#  The moment a new M1 bar opens, rates[1] advances to the bar that just
-#  closed, which is strictly greater than the seeded value, firing the loop.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_last_closed_bar_time():
-    """Return timestamp of the last fully closed M1 bar for SYMBOLS[0]."""
     rates = mt5.copy_rates_from_pos(SYMBOLS[0], mt5.TIMEFRAME_M1, 0, 2)
     if rates is not None and len(rates) >= 2:
         return pd.Timestamp(rates[1]["time"], unit="s")
@@ -571,7 +680,7 @@ def wait_for_new_bar(last_bar_time):
 #  SECTION 11 — PROCESS ONE SYMBOL PER BAR
 # ══════════════════════════════════════════════════════════════════════════════
 
-def process_symbol(sym, sym_st, metrics, balance, bar_count):
+def process_symbol(sym, sym_st, metrics, sig_counter, balance, bar_count):
     df = fetch_bars(sym)
     if df is None:
         return
@@ -638,6 +747,10 @@ def process_symbol(sym, sym_st, metrics, balance, bar_count):
             sym_st["prev_sweep"] = (bull, bear)
 
         if direction is not None:
+            # Increment live counter and refresh report before placing order
+            sig_counter.increment_live(sym)
+            sig_counter.report()
+
             positions = mt5.positions_get(symbol=sym)
             positions = [p for p in positions if p.magic == MAGIC] if positions else []
             if positions:
@@ -736,9 +849,18 @@ def run_live():
             )
     logger.info("=== END DIAGNOSTIC ===")
 
-    sym_states = {s: make_sym_state() for s in SYMBOLS}
-    metrics    = Metrics(SYMBOLS)
-    bar_count  = 0
+    sym_states  = {s: make_sym_state() for s in SYMBOLS}
+    metrics     = Metrics(SYMBOLS)
+    sig_counter = SignalCounter(SYMBOLS)
+    bar_count   = 0
+
+    # ── Startup: scan history and report signal frequency ─────────────────
+    logger.info("=== SCANNING HISTORY FOR SIGNAL FREQUENCY ===")
+    for sym in SYMBOLS:
+        df_hist = fetch_bars(sym, FETCH_BARS)
+        sig_counter.scan_history(sym, df_hist)
+    sig_counter.report()
+    logger.info("=== END SIGNAL FREQUENCY SCAN ===")
 
     # ── Startup recovery ──────────────────────────────────────────────────
     for sym in SYMBOLS:
@@ -770,7 +892,7 @@ def run_live():
             balance = mt5.account_info().balance
 
             for sym in SYMBOLS:
-                process_symbol(sym, sym_states[sym], metrics, balance, bar_count)
+                process_symbol(sym, sym_states[sym], metrics, sig_counter, balance, bar_count)
 
             metrics.check_hourly(balance)
 
