@@ -2,7 +2,7 @@
 
 # MULTI-MODEL FX STRATEGY ENGINE  |  M1  |  VECTORIZED  |  NO LOOKAHEAD
 
-Model 1 : London Liquidity Expansion        (medium vol regime, 07:00-10:00 UTC)
+"""Model 1 : London Liquidity Expansion        (medium vol regime, 07:00-10:00 UTC)
 Model 2 : New York Trend Exhaustion         (high vol regime,   12:30-15:00 UTC)
 Model 3 : Volatility Compression Breakout   (low vol regime,    excl rollover)
 
@@ -22,7 +22,7 @@ mme_m{1,2,3}_grid.csv    — full grid results per symbol
 mme_m{1,2,3}_agg.csv     — aggregated results across all symbols
 multi_model_engine.log   — full run log
 
-“””
+“””"""
 
 import os, sys, io, logging, itertools, time, bisect
 import numpy as np
