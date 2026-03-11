@@ -1,953 +1,797 @@
-"""
-==============================================================================
-Vigintillion Live Engine  v3  |  M1  |  AUDJPY + EURJPY + EURAUD + GBPJPY + USDJPY
-==============================================================================
-Backtest results (2.5M bars, no cooldown, no session cap — vig_backtest.py):
-  AUDJPY  WR=79.6%  E=+0.985  n=1895  T/wk=5.41
-  EURJPY  WR=77.6%  E=+0.944  n=1849  T/wk=5.27
-  EURAUD  WR=77.7%  E=+0.944  n=1800  T/wk=5.13
-  GBPJPY  WR=77.0%  E=+0.940  n=1854  T/wk=5.29
-  USDJPY  WR=74.0%  E=+0.858  n=1809  T/wk=5.15
-  COMBINED  WR=77.2%  9207 trades  26.23/wk  MDD=6.0%  Max loss streak=11
+# “””
 
-CHANGES FROM v2:
-  REMOVED: COOLDOWN_BARS — BT proved cooldown cuts trade count ~50% with no
-           benefit to WR or MDD. Every valid signal enters immediately.
-  REMOVED: MAX_TRADES_PER_SESSION — BT proved no cap needed. MDD=6% without it.
-  KEPT:    All exits (VWAP cross, 3 consec adverse, max hold, session boundary)
-           Early exits proven to save ~620R over 350 weeks vs removing them.
+# MULTI-MODEL FX STRATEGY ENGINE  |  M1  |  VECTORIZED  |  NO LOOKAHEAD
 
-ARCHITECTURE:
-  - One MT5 connection, one bar-close loop
-  - Per-symbol state machines running in parallel within same loop iteration
-  - Each symbol independent: own position, own session counter, own Asian range
-  - Broker cross-check per symbol on every bar
-  - Risk: 6% per trade per symbol (concurrent positions each risk 6%)
-  - All exits (SL/TP server-side + early exits manual close)
+Model 1 : London Liquidity Expansion        (medium vol regime, 07:00-10:00 UTC)
+Model 2 : New York Trend Exhaustion         (high vol regime,   12:30-15:00 UTC)
+Model 3 : Volatility Compression Breakout   (low vol regime,    excl rollover)
 
-LOGIC VERIFIED IDENTICAL TO BACKTEST:
-  ✓ Regime: rvol_30 <= rvol_q60 AND bar_range <= spread_q40
-  ✓ Sweep: roll_lo/hi over lookback=10, atr_mult=0.2, + asian range sweeps
-  ✓ Displacement: body >= 0.4*ATR with body_ratio >= 0.70 OR vol spike + close_pos
-  ✓ db_next: signal fires if displacement on signal bar OR next bar (bar i or i+1)
-  ✓ SL: sweep extreme - buffer*ATR (long) or + buffer*ATR (short)
-  ✓ TP: SL distance * rr_ratio (1.5)
-  ✓ Early exit E1: VWAP adverse cross after hold >= 3
-  ✓ Early exit E2: 3 consecutive adverse candles after hold >= 3
-  ✓ Session force-close at window boundary
-  ✓ Max hold: 60 bars
-  ✓ NO cooldown
-  ✓ NO max trades per session
-==============================================================================
-"""
+Rules
 
-import os, sys, io, time, logging, datetime
+- Signal detected at close of bar i using ONLY data[0..i]
+- Entry price  = open[i+1]  (no lookahead)
+- Spread-aware: long  entry = open[i+1] + spread[i+1]/2
+  short entry = open[i+1] - spread[i+1]/2
+- SL/TP triggers: long uses bid, short uses ask
+- Session windows use UTC timestamps — NOT bar counts
+- Grid <= 20,000 combos per model
+
+# Outputs
+mme_m{1,2,3}_trades.csv  — every trade with all required fields
+mme_m{1,2,3}_grid.csv    — full grid results per symbol
+mme_m{1,2,3}_agg.csv     — aggregated results across all symbols
+multi_model_engine.log   — full run log
+
+“””
+
+import os, sys, io, logging, itertools, time, bisect
 import numpy as np
 import pandas as pd
 from logging.handlers import RotatingFileHandler
 
 try:
-    import MetaTrader5 as mt5
-    MT5_AVAILABLE = True
+import MetaTrader5 as mt5
+MT5_AVAILABLE = True
 except ImportError:
-    MT5_AVAILABLE = False
-    print("ERROR: MetaTrader5 not installed.  pip install MetaTrader5")
-    sys.exit(1)
+MT5_AVAILABLE = False
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-logger = logging.getLogger("VIG_V3")
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+logger = logging.getLogger(“MME”)
 logger.setLevel(logging.INFO)
-_fh = RotatingFileHandler("live_multi_v3.log", maxBytes=10_000_000, backupCount=5, encoding="utf-8")
-_fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+_fh = RotatingFileHandler(“multi_model_engine.log”, maxBytes=20_000_000,
+backupCount=2, encoding=“utf-8”)
+_fh.setFormatter(logging.Formatter(”%(asctime)s | %(message)s”))
 logger.addHandler(_fh)
-_sh = logging.StreamHandler(io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace"))
-_sh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+_sh = logging.StreamHandler(io.TextIOWrapper(sys.stdout.buffer,
+encoding=“utf-8”, errors=“replace”))
+_sh.setFormatter(logging.Formatter(”%(message)s”))
 logger.addHandler(_sh)
 
-# ── MT5 connection ────────────────────────────────────────────────────────────
-TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH", r"C:\Program Files\MetaTrader 5\terminal64.exe")
-LOGIN         = int(os.environ.get("MT5_LOGIN", 0))
-PASSWORD      = os.environ.get("MT5_PASSWORD", "")
-SERVER        = os.environ.get("MT5_SERVER", "")
+# ── MT5 connection ─────────────────────────────────────────────────────────────
 
-# ── Symbols ───────────────────────────────────────────────────────────────────
-SYMBOLS = ["AUDJPY", "EURJPY", "EURAUD", "GBPJPY", "USDJPY"]
+TERMINAL_PATH = os.environ.get(“MT5_TERMINAL_PATH”,
+r”C:\Program Files\MetaTrader 5\terminal64.exe”)
+LOGIN    = int(os.environ.get(“MT5_LOGIN”,    0))
+PASSWORD =     os.environ.get(“MT5_PASSWORD”, “”)
+SERVER   =     os.environ.get(“MT5_SERVER”,   “”)
 
-# ── Strategy constants ────────────────────────────────────────────────────────
+FETCH_BARS     = 500_000
+SYMBOLS        = [“AUDJPY”, “EURJPY”, “EURAUD”, “GBPJPY”, “USDJPY”]
+MIN_TRADES     = 50
 RISK_PER_TRADE = 0.06
-MAGIC          = 202602260
-COMMENT        = "VIGINTILLION_V3"
-MAX_HOLD       = 60
-VWAP_WINDOW    = 10
-SL_MULTIPLIER  = 1.0
-FETCH_BARS     = 50_000
-# NO COOLDOWN_BARS — removed per BT analysis
-# NO MAX_TRADES_PER_SESSION — removed per BT analysis
+MAX_HOLD_BARS  = 120      # 2-hour hard cap
 
-# ── Best params (identical to backtest) ──────────────────────────────────────
-BEST_PARAMS = {
-    "vol_threshold_q": "q60",
-    "spread_q":        "q40",
-    "sweep_lookback":  10,
-    "sweep_atr_mult":  0.2,
-    "body_atr_mult":   0.4,
-    "vol_mult":        2.0,
-    "buffer_atr":      0.2,
-    "rr_ratio":        1.5,
+# Fixed vol regime thresholds (per spec)
+
+RV_LOW_PCT  = 40
+RV_MED_LO   = 40
+RV_MED_HI   = 60
+RV_HIGH_PCT = 80
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# GRID DEFINITION
+
+# Each model runs independently. Total = N_GLOBAL x N_Mx per model.
+
+# All three are well under 20,000.
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+GRID_GLOBAL = {
+“rv_window”:            [120, 60],     # RV lookback bars
+“efficiency_window”:    [20,  10],     # efficiency ratio window
+“efficiency_threshold”: [0.3, 0.2],    # min directional efficiency
 }
 
-STATE_FLAT        = "FLAT"
-STATE_IN_POSITION = "IN_POSITION"
+# N_GLOBAL = 8
 
+GRID_M1 = {
+“asia_range_pct”:    [25, 35, 45],    # asian range must be below this pct of history
+“body_mult”:         [1.5, 1.0, 0.7], # body >= mult * median_body
+“tp_mult”:           [3.0, 2.0, 1.5], # TP = entry +/- asia_range * mult
+“stop_buffer_atr”:   [0.2, 0.0],      # extra ATR buffer on stop
+}
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 1 — INDICATORS
-# ══════════════════════════════════════════════════════════════════════════════
+# 8 x 54 = 432 combos
 
-def compute_atr(h, l, c, period=14):
-    tr = np.maximum(h - l,
-         np.maximum(np.abs(h - np.roll(c, 1)),
-                    np.abs(l - np.roll(c, 1))))
-    tr[0] = h[0] - l[0]
-    return pd.Series(tr).rolling(period).mean().values
+GRID_M2 = {
+“ldn_move_pct”:      [80, 70, 60],    # london move must exceed this percentile
+“wick_mult”:         [2.5, 2.0, 1.5], # wick >= mult * body
+“tp_multiple”:       [3.0, 2.0, 1.5], # TP = entry +/- tp_mult * stop_dist
+“stop_buffer_atr”:   [0.2, 0.0],
+}
 
-def rolling_realized_vol(c, window):
-    lr = np.diff(np.log(np.maximum(c, 1e-9)), prepend=np.log(c[0]))
-    return pd.Series(lr).rolling(window).std().values
+# 8 x 54 = 432 combos
 
-def rolling_quantile(arr, window, q):
-    return pd.Series(arr).rolling(window, min_periods=window // 2).quantile(q).values
+GRID_M3 = {
+“box_lookback”:      [60, 40, 20],    # consolidation window bars
+“box_atr_ratio”:     [1.5, 1.0, 0.7], # box_range <= ATR * ratio
+“expansion_mult”:    [1.5, 1.2, 1.0], # bar_range >= mult * median_range
+“tp_mult”:           [3.0, 2.0, 1.5], # TP = entry +/- box_range * mult
+}
 
-def micro_vwap(h, l, c, v, window):
-    tp      = (h + l + c) / 3.0
-    cum_tpv = pd.Series(tp * v).rolling(window).sum().values
-    cum_v   = pd.Series(v.astype(float)).rolling(window).sum().values
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return np.where(cum_v > 0, cum_tpv / cum_v, c)
+# 8 x 81 = 648 combos
 
+def _ncombos(g):
+r = 1
+for v in g.values(): r *= len(v)
+return r
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 2 — INDICATOR COMPUTATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def compute_indicators(df):
-    o = df["open"].values
-    h = df["high"].values
-    l = df["low"].values
-    c = df["close"].values
-    v = df["tick_volume"].values
-    n = len(c)
-
-    ind = {"o": o, "h": h, "l": l, "c": c, "v": v}
-    ind["atr14"]   = compute_atr(h, l, c, 14)
-    ind["rvol_30"] = rolling_realized_vol(c, 30)
-
-    VOL_LB = min(28_800, n // 2)
-    for q in [40, 50, 60]:
-        ind[f"rvol_q{q}"] = rolling_quantile(ind["rvol_30"], VOL_LB, q / 100)
-
-    bar_range = h - l
-    ind["bar_range"] = bar_range
-    SPR_LB = min(43_200, n // 2)
-    for q in [20, 30, 40]:
-        ind[f"spread_q{q}"] = rolling_quantile(bar_range, SPR_LB, q / 100)
-
-    ind["vol_mean_60"] = pd.Series(v.astype(float)).rolling(60, min_periods=10).mean().values
-    ind["vwap"]        = micro_vwap(h, l, c, v, VWAP_WINDOW)
-
-    body = np.abs(c - o); rng = h - l
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ind["body_ratio"] = np.where(rng > 0, body / rng, 0.0)
-        ind["close_pos"]  = np.where(rng > 0, (c - l) / rng, 0.5)
-
-    dt    = pd.DatetimeIndex(df["time"])
-    hours = dt.hour
-    ind["in_window"] = ((hours >= 7) & (hours < 10)) | ((hours >= 13) & (hours < 15))
-    ind["times"]     = df["time"].values
-    ind["dates"]     = np.array(dt.date)
-    ind["hours"]     = np.array(hours)
-    return ind
-
+assert _ncombos(GRID_GLOBAL) * _ncombos(GRID_M1) <= 20_000
+assert _ncombos(GRID_GLOBAL) * _ncombos(GRID_M2) <= 20_000
+assert _ncombos(GRID_GLOBAL) * _ncombos(GRID_M3) <= 20_000
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 3 — ASIAN RANGE TRACKER
-# ══════════════════════════════════════════════════════════════════════════════
 
-class AsianRangeTracker:
-    def __init__(self):
-        self.today_date = None
-        self.today_hi   = -np.inf
-        self.today_lo   = +np.inf
-        self.prev_hi    = np.nan
-        self.prev_lo    = np.nan
-
-    def update(self, bar_time, bar_h, bar_l):
-        if hasattr(bar_time, "date"):
-            d    = bar_time.date()
-            hour = bar_time.hour
-        else:
-            dt   = datetime.datetime.fromtimestamp(
-                       bar_time.astype("int64") // 1_000_000_000,
-                       tz=datetime.timezone.utc)
-            d    = dt.date()
-            hour = dt.hour
-
-        if d != self.today_date:
-            if self.today_date is not None and self.today_hi > -np.inf:
-                self.prev_hi = self.today_hi
-                self.prev_lo = self.today_lo
-            self.today_date = d
-            self.today_hi   = -np.inf
-            self.today_lo   = +np.inf
-
-        if 0 <= hour < 7:
-            self.today_hi = max(self.today_hi, bar_h)
-            self.today_lo = min(self.today_lo, bar_l)
-
-    def get(self):
-        return self.prev_hi, self.prev_lo
-
+# PROGRESS BAR
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 4 — SIGNAL DETECTION
-# ══════════════════════════════════════════════════════════════════════════════
 
-def compute_displacement_flags(ind, i):
-    p       = BEST_PARAMS
-    atr     = ind["atr14"][i]
-    c_i     = ind["c"][i]; o_i = ind["o"][i]
-    body    = abs(c_i - o_i)
-    disp_Ab = (c_i > o_i) and (body >= p["body_atr_mult"] * atr) and (ind["body_ratio"][i] >= 0.70)
-    disp_As = (c_i < o_i) and (body >= p["body_atr_mult"] * atr) and (ind["body_ratio"][i] >= 0.70)
-    vs      = ind["v"][i] >= p["vol_mult"] * ind["vol_mean_60"][i]
-    disp_Bb = vs and (ind["close_pos"][i] >= 0.80)
-    disp_Bs = vs and (ind["close_pos"][i] <= 0.20)
-    return (disp_Ab or disp_Bb), (disp_As or disp_Bs)
+class Bar:
+def **init**(self, total, prefix=””, w=48):
+self.total = total; self.w = w
+self.prefix = prefix; self.cur = 0
+self.t0 = time.time(); self._show(0)
 
+```
+def step(self, n=1):
+    self.cur = min(self.cur + n, self.total); self._show(self.cur)
 
-def check_entry_signal(ind, asian_hi, asian_lo, prev_disp):
-    """
-    No cooldown gate. No session cap gate.
-    Only gates: in_window, regime, sweep+displacement.
-    """
-    i  = len(ind["c"]) - 1
-    p  = BEST_PARAMS
-
-    if not ind["in_window"][i]:
-        return None, None, None, None
-
-    vq = p["vol_threshold_q"].replace("q", "")
-    sq = p["spread_q"].replace("q", "")
-    if not ((ind["rvol_30"][i] <= ind[f"rvol_q{vq}"][i]) and
-            (ind["bar_range"][i] <= ind[f"spread_q{sq}"][i])):
-        return None, None, None, None
-
-    N    = p["sweep_lookback"]
-    mult = p["sweep_atr_mult"]
-    atr  = ind["atr14"][i]
-    start = max(0, i - N)
-
-    roll_lo = ind["l"][start:i].min() if i > start else np.nan
-    roll_hi = ind["h"][start:i].max() if i > start else np.nan
-    h_i = ind["h"][i]; l_i = ind["l"][i]; c_i = ind["c"][i]
-
-    bull_gen   = (not np.isnan(roll_lo)) and (l_i < roll_lo - mult * atr) and (c_i > roll_lo)
-    bear_gen   = (not np.isnan(roll_hi)) and (h_i > roll_hi + mult * atr) and (c_i < roll_hi)
-    has_range  = not (np.isnan(asian_hi) or np.isnan(asian_lo))
-    bull_asian = has_range and (l_i < asian_lo - mult * atr * 0.5) and (c_i > asian_lo)
-    bear_asian = has_range and (h_i > asian_hi + mult * atr * 0.5) and (c_i < asian_hi)
-    sweep_bull_cur = bull_gen or bull_asian
-    sweep_bear_cur = bear_gen or bear_asian
-
-    disp_bull_cur, disp_bear_cur = compute_displacement_flags(ind, i)
-
-    prev_sweep_bull, prev_sweep_bear = prev_disp
-
-    long_cond  = (sweep_bull_cur and disp_bull_cur) or (prev_sweep_bull and disp_bull_cur)
-    short_cond = (sweep_bear_cur and disp_bear_cur) or (prev_sweep_bear and disp_bear_cur)
-
-    if not (long_cond or short_cond):
-        return None, None, None, (sweep_bull_cur, sweep_bear_cur)
-
-    if long_cond and short_cond:
-        return None, None, None, (sweep_bull_cur, sweep_bear_cur)
-
-    direction = "long" if long_cond else "short"
-    buf       = p["buffer_atr"]
-    rr        = p["rr_ratio"]
-
-    if direction == "long":
-        sl_price = (roll_lo - buf * atr) if not np.isnan(roll_lo) else (c_i - SL_MULTIPLIER * atr)
-    else:
-        sl_price = (roll_hi + buf * atr) if not np.isnan(roll_hi) else (c_i + SL_MULTIPLIER * atr)
-
-    return direction, sl_price, rr, (sweep_bull_cur, sweep_bear_cur)
-
+def _show(self, done):
+    p   = done / self.total if self.total else 1
+    f   = int(self.w * p)
+    el  = time.time() - self.t0
+    eta = (el / p - el) if p > 0.001 else 0
+    sys.stdout.write(
+        f"\r{self.prefix} [{'█'*f}{'░'*(self.w-f)}] "
+        f"{done}/{self.total} {p*100:.0f}%  {el:.0f}s  ETA {eta:.0f}s   "
+    )
+    sys.stdout.flush()
+    if done >= self.total:
+        sys.stdout.write("\n"); sys.stdout.flush()
+```
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 5 — EARLY EXIT
-# ══════════════════════════════════════════════════════════════════════════════
 
-def check_early_exit(ind, trade_state, sym):
-    i   = len(ind["c"]) - 1
-    dir = trade_state["direction"]
-
-    trade_state["hold_count"] += 1
-    hc = trade_state["hold_count"]
-
-    if hc >= MAX_HOLD:
-        logger.info(f"  [{sym}] EXIT: max hold ({MAX_HOLD} bars)")
-        return True
-
-    if not ind["in_window"][i]:
-        logger.info(f"  [{sym}] EXIT: session boundary")
-        return True
-
-    if i >= 1 and hc >= 3:
-        cur_c  = ind["c"][i];   cur_vwap  = ind["vwap"][i]
-        prev_c = ind["c"][i-1]; prev_vwap = ind["vwap"][i-1]
-        if dir == "long"  and (cur_c < cur_vwap)  and (prev_c >= prev_vwap):
-            logger.info(f"  [{sym}] EXIT: VWAP cross (long)")
-            return True
-        if dir == "short" and (cur_c > cur_vwap)  and (prev_c <= prev_vwap):
-            logger.info(f"  [{sym}] EXIT: VWAP cross (short)")
-            return True
-
-    adverse = (ind["c"][i] < ind["o"][i]) if dir == "long" else (ind["c"][i] > ind["o"][i])
-    if adverse:
-        trade_state["consec_adverse"] += 1
-    else:
-        trade_state["consec_adverse"] = 0
-
-    if trade_state["consec_adverse"] >= 3 and hc >= 3:
-        logger.info(f"  [{sym}] EXIT: 3 consec adverse candles")
-        return True
-
-    return False
-
+# DATA FETCH
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 6 — ORDER EXECUTION
-# ══════════════════════════════════════════════════════════════════════════════
 
-def compute_lot_size(symbol, entry_price, sl_price, balance):
-    sym_info = mt5.symbol_info(symbol)
-    if sym_info is None:
-        logger.error(f"symbol_info({symbol}) returned None")
-        return None
+def fetch(sym, n=FETCH_BARS):
+rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, n)
+if rates is None or len(rates) < 2000:
+logger.warning(f”  {sym}: fetch failed — {mt5.last_error()}”)
+return None
+df = pd.DataFrame(rates)
+# ── IC Markets broker time → UTC ──────────────────────────────────────
+# IC Markets uses EET/EEST (Europe/Athens): UTC+2 winter, UTC+3 summer.
+# MT5 copy_rates returns Unix timestamps in BROKER LOCAL time (not UTC).
+# We must localize as Europe/Athens then convert to UTC so session
+# window logic (Asia 00:00, London 07:00, NY 12:30) is correct year-round.
+#
+# Note: MT5 timestamps are stored as seconds since epoch but represent
+# broker wall-clock time. So we first interpret them as broker-local,
+# then shift to UTC using the correct DST-aware offset.
+raw_ts = pd.to_datetime(df[“time”], unit=“s”)   # naive, in broker local time
+try:
+# tz_localize interprets the naive timestamps as Europe/Athens local time
+# and handles DST transitions (ambiguous=infer resolves overlap at clock-back)
+broker_aware = raw_ts.dt.tz_localize(
+“Europe/Athens”, ambiguous=“infer”, nonexistent=“shift_forward”
+)
+utc_ts = broker_aware.dt.tz_convert(“UTC”).dt.tz_localize(None)
+except Exception:
+# Fallback if pytz/zoneinfo not available: use fixed UTC+2
+# This is wrong during EEST (summer) by 1 hour but avoids crash
+logger.warning(”  pytz/zoneinfo DST conversion failed — falling back to UTC+2 fixed offset”)
+utc_ts = raw_ts - pd.Timedelta(hours=2)
+df[“time”]       = utc_ts
+df[“h_utc”]      = df[“time”].dt.hour
+df[“m_utc”]      = df[“time”].dt.minute
+df[“date”]       = df[“time”].dt.date
+df[“min_of_day”] = df[“h_utc”] * 60 + df[“m_utc”]
 
-    pip_value_per_lot = sym_info.trade_tick_value / sym_info.trade_tick_size
-    risk_amount       = balance * RISK_PER_TRADE
-    stop_dist         = abs(entry_price - sl_price)
+```
+if "spread" in df.columns:
+    info  = mt5.symbol_info(sym)
+    point = info.point if info else 0.0001
+    df["spread_price"] = df["spread"].astype(float) * point
+else:
+    df["spread_price"] = np.nan
 
-    if stop_dist < 1e-9:
-        logger.error(f"[{symbol}] Stop distance zero")
-        return None
-
-    raw = risk_amount / (stop_dist * pip_value_per_lot)
-    lot = max(sym_info.volume_min,
-              min(sym_info.volume_max,
-                  round(raw / sym_info.volume_step) * sym_info.volume_step))
-    return lot
-
-
-def send_entry_order(symbol, direction, sl_price, tp_price, lot):
-    tick  = mt5.symbol_info_tick(symbol)
-    price = tick.ask if direction == "long" else tick.bid
-    otype = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
-
-    req = {
-        "action":       mt5.TRADE_ACTION_DEAL,
-        "symbol":       symbol,
-        "volume":       lot,
-        "type":         otype,
-        "price":        price,
-        "sl":           sl_price,
-        "tp":           tp_price,
-        "deviation":    10,
-        "magic":        MAGIC,
-        "comment":      COMMENT,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    result = mt5.order_send(req)
-    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        logger.error(f"[{symbol}] Entry FAILED retcode={getattr(result,'retcode',None)} {getattr(result,'comment','')}")
-        return None
-    logger.info(f"[{symbol}] ENTRY {direction.upper()} lot={lot} price={price:.5f} sl={sl_price:.5f} tp={tp_price:.5f} ticket={result.order}")
-    return result
-
-
-def send_close_order(symbol, position):
-    otype = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-    tick  = mt5.symbol_info_tick(symbol)
-    price = tick.bid if position.type == mt5.ORDER_TYPE_BUY else tick.ask
-
-    req = {
-        "action":       mt5.TRADE_ACTION_DEAL,
-        "symbol":       symbol,
-        "volume":       position.volume,
-        "type":         otype,
-        "position":     position.ticket,
-        "price":        price,
-        "deviation":    10,
-        "magic":        MAGIC,
-        "comment":      "early_exit",
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    result = mt5.order_send(req)
-    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        logger.error(f"[{symbol}] Close FAILED retcode={getattr(result,'retcode',None)}")
-        return False
-    logger.info(f"[{symbol}] CLOSED ticket={position.ticket} price={price:.5f}")
-    return True
-
+logger.info(
+    f"  {sym}: {len(df):,} bars  "
+    f"{df['time'].iloc[0].date()} → {df['time'].iloc[-1].date()}  "
+    f"spread={'col' if 'spread' in df.columns else 'fixed'}"
+)
+return df.reset_index(drop=True)
+```
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 7 — STATE RECONSTRUCTION
-# ══════════════════════════════════════════════════════════════════════════════
 
-def reconstruct_state(symbol, position, df):
-    entry_time = datetime.datetime.fromtimestamp(position.time, tz=datetime.timezone.utc)
-    now_utc    = datetime.datetime.now(tz=datetime.timezone.utc)
-    hold_count = max(0, int((now_utc - entry_time).total_seconds() / 60))
-    direction  = "long" if position.type == mt5.ORDER_TYPE_BUY else "short"
-    sl_price   = position.sl
-    ep         = position.price_open
-    sl_dist    = abs(ep - sl_price) if sl_price else 0.01
+# BASE CACHE — computed once per symbol
 
-    consec = 0
-    for k in range(min(3, len(df))):
-        idx = -(k + 1)
-        adv = (df["close"].values[idx] < df["open"].values[idx]) if direction == "long" \
-              else (df["close"].values[idx] > df["open"].values[idx])
-        if adv:
-            consec += 1
-        else:
-            break
+# Contains everything that does NOT depend on grid params.
 
-    logger.info(f"[{symbol}] RECOVERED: dir={direction} entry={ep:.5f} hold={hold_count}bars")
-    return {
-        "direction":      direction,
-        "entry_price":    ep,
-        "sl_price":       sl_price,
-        "tp_price":       position.tp,
-        "sl_dist":        sl_dist,
-        "lot":            position.volume,
-        "hold_count":     hold_count,
-        "consec_adverse": consec,
-        "ticket":         position.ticket,
-    }
-
+# rv_window and efficiency_window vary per combo → recomputed inside grid loop.
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 8 — PER-SYMBOL STATE
-#  No last_exit_bar, no sess_count — cooldown and session cap removed
-# ══════════════════════════════════════════════════════════════════════════════
 
-def make_sym_state():
-    return {
-        "state":       STATE_FLAT,
-        "trade_state": None,
-        "asian":       AsianRangeTracker(),
-        "prev_sweep":  (False, False),
-    }
+def build_base_cache(df):
+o   = df[“open”].values.astype(np.float64)
+h   = df[“high”].values.astype(np.float64)
+l   = df[“low”].values.astype(np.float64)
+c   = df[“close”].values.astype(np.float64)
+sp  = df[“spread_price”].values.astype(np.float64)
+mod = df[“min_of_day”].values.astype(np.int32)
+dt  = df[“date”].values
+n   = len(c)
 
+```
+# ATR-14 (EWM)
+tr  = np.maximum(h - l,
+      np.maximum(np.abs(h - np.roll(c, 1)),
+                 np.abs(l - np.roll(c, 1))))
+tr[0] = h[0] - l[0]
+atr = pd.Series(tr).ewm(span=14, adjust=False).mean().values
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 9 — METRICS
-# ══════════════════════════════════════════════════════════════════════════════
+# Body / range
+body      = np.abs(c - o)
+bar_range = h - l
+med_body  = pd.Series(body).rolling(100, min_periods=10).median().values
+med_range = pd.Series(bar_range).rolling(100, min_periods=10).median().values
 
-class Metrics:
-    def __init__(self, symbols):
-        self.sym    = {s: {"trades": 0, "wins": 0, "total_r": 0.0} for s in symbols}
-        self.peak   = None
-        self.max_dd = 0.0
-        self.last_h = None
+# Session masks — UTC minute-of-day, NOT bar counts
+asia_mask   = (mod >= 0)    & (mod < 360)    # 00:00-06:00
+london_mask = (mod >= 420)  & (mod < 600)    # 07:00-10:00 (M1 trade window)
+ny_mask     = (mod >= 750)  & (mod < 900)    # 12:30-15:00
+rollover    = (mod >= 1380) | (mod < 60)     # 23:00-01:00
 
-    def record(self, sym, r, balance):
-        d = self.sym[sym]
-        d["trades"]  += 1
-        d["wins"]    += 1 if r > 0 else 0
-        d["total_r"] += r
-        if self.peak is None or balance > self.peak:
-            self.peak = balance
-        if self.peak > 0:
-            self.max_dd = max(self.max_dd, (self.peak - balance) / self.peak)
+# ── Asian range per day (no lookahead: use today's range only within london window)
+unique_d    = np.unique(dt)
+day_ah, day_al, day_ar = {}, {}, {}
+for d in unique_d:
+    m = (dt == d) & asia_mask
+    if m.any():
+        day_ah[d] = h[m].max()
+        day_al[d] = l[m].min()
+        day_ar[d] = day_ah[d] - day_al[d]
 
-    def hourly_report(self, balance):
-        tot_t = sum(d["trades"]  for d in self.sym.values())
-        tot_w = sum(d["wins"]    for d in self.sym.values())
-        tot_r = sum(d["total_r"] for d in self.sym.values())
-        wr    = tot_w / tot_t if tot_t else 0.0
-        exp   = tot_r / tot_t if tot_t else 0.0
-        logger.info(
-            f"\n{'='*55}\n[HOURLY REPORT]\n"
-            f"  Total trades : {tot_t}\n"
-            f"  Win rate     : {wr:.1%}\n"
-            f"  Expectancy   : {exp:+.2f}R\n"
-            f"  Total R      : {tot_r:+.1f}\n"
-            f"  Max DD       : {self.max_dd:.1%}\n"
-            f"  Equity       : {balance:,.2f}\n"
-        )
-        for s, d in self.sym.items():
-            if d["trades"] > 0:
-                swr  = d["wins"] / d["trades"]
-                sexp = d["total_r"] / d["trades"]
-                logger.info(f"    {s:8s}  n={d['trades']:>4}  WR={swr:.1%}  E={sexp:+.3f}R  totalR={d['total_r']:+.1f}")
-        logger.info('='*55)
+a_hi  = np.full(n, np.nan)
+a_lo  = np.full(n, np.nan)
+a_rng = np.full(n, np.nan)
+a_pct = np.full(n, np.nan)
+sorted_ar = []; seen_ad = set()
+for i in range(n):
+    if london_mask[i]:
+        d = dt[i]
+        if d in day_ah:
+            a_hi[i]  = day_ah[d]
+            a_lo[i]  = day_al[d]
+            a_rng[i] = day_ar[d]
+            r = day_ar[d]
+            if len(sorted_ar) > 0:
+                a_pct[i] = bisect.bisect_left(sorted_ar, r) / len(sorted_ar) * 100
+            if d not in seen_ad:
+                bisect.insort(sorted_ar, r)
+                seen_ad.add(d)
 
-    def check_hourly(self, balance):
-        h = datetime.datetime.now(datetime.timezone.utc).hour
-        if self.last_h is None:
-            self.last_h = h
-        if h != self.last_h:
-            self.last_h = h
-            self.hourly_report(balance)
+# ── London move per day: close of 11:59 bar minus open of 07:00 bar
+ldn_o_bar = (mod >= 420) & (mod < 421)
+ldn_c_bar = (mod >= 719) & (mod < 720)
+lo_by_d, lc_by_d = {}, {}
+for i in range(n):
+    d = dt[i]
+    if ldn_o_bar[i]: lo_by_d[d] = o[i]
+    if ldn_c_bar[i]: lc_by_d[d] = c[i]
 
+ldn_move = np.full(n, np.nan)
+ldn_mpct = np.full(n, np.nan)
+sorted_lm = []; seen_ld = set()
+for i in range(n):
+    if ny_mask[i]:
+        d = dt[i]
+        if d in lo_by_d and d in lc_by_d:
+            mv = lc_by_d[d] - lo_by_d[d]
+            ldn_move[i] = mv
+            ab = abs(mv)
+            if len(sorted_lm) > 0:
+                ldn_mpct[i] = bisect.bisect_left(sorted_lm, ab) / len(sorted_lm) * 100
+            if d not in seen_ld:
+                bisect.insort(sorted_lm, ab)
+                seen_ld.add(d)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 9b — SIGNAL COUNTER
-#  State machine with NO cooldown, NO session cap — matches BT exactly.
-# ══════════════════════════════════════════════════════════════════════════════
+# log returns (needed for RV — stored raw, RV computed per rv_window in grid)
+log_ret = np.diff(np.log(np.maximum(c, 1e-9)), prepend=np.log(c[0]))
 
-class SignalCounter:
-    def __init__(self, symbols):
-        self.symbols      = symbols
-        self.counts       = {s: 0    for s in symbols}
-        self.live_counts  = {s: 0    for s in symbols}
-        self.bar_from     = {s: None for s in symbols}
-        self.bar_to       = {s: None for s in symbols}
-        self.engine_start = datetime.datetime.now(datetime.timezone.utc)
-
-    def scan_history(self, sym, df):
-        """
-        Bar-by-bar state machine. No cooldown, no session cap.
-        Enforces: in_window, regime, asian sweeps, VWAP exit, consec adverse,
-        max hold, session boundary — identical to BT and process_symbol.
-        """
-        if df is None or len(df) < 100:
-            return
-
-        ind = compute_indicators(df)
-        n   = len(ind["c"])
-        p   = BEST_PARAMS
-        vq  = p["vol_threshold_q"].replace("q", "")
-        sq  = p["spread_q"].replace("q", "")
-        N   = p["sweep_lookback"]
-        mult= p["sweep_atr_mult"]
-
-        # ── Asian range arrays ────────────────────────────────────────────
-        hours      = ind["hours"]
-        dates      = ind["dates"]
-        asian_mask = (hours >= 0) & (hours < 7)
-        unique_d   = np.unique(dates)
-        date_hi    = {}; date_lo = {}
-        for d in unique_d:
-            m = (dates == d) & asian_mask
-            if m.any():
-                date_hi[d] = ind["h"][m].max()
-                date_lo[d] = ind["l"][m].min()
-        sc_asian_hi = np.full(n, np.nan)
-        sc_asian_lo = np.full(n, np.nan)
-        cur_d = None; prev_hi = np.nan; prev_lo = np.nan
-        for i in range(n):
-            d = dates[i]
-            if d != cur_d:
-                cur_d = d
-                for delta in range(1, 8):
-                    pd_ = d - datetime.timedelta(days=delta)
-                    if pd_ in date_hi:
-                        prev_hi = date_hi[pd_]
-                        prev_lo = date_lo[pd_]
-                        break
-            if ind["in_window"][i]:
-                sc_asian_hi[i] = prev_hi
-                sc_asian_lo[i] = prev_lo
-
-        # ── State machine — no cooldown, no session cap ───────────────────
-        prev_sweep     = (False, False)
-        in_position    = False
-        hold_count     = 0
-        consec_adverse = 0
-        trade_dir      = None
-        count          = 0
-
-        for i in range(n):
-            atr     = ind["atr14"][i]
-            start   = max(0, i - N)
-            roll_lo = ind["l"][start:i].min() if i > start else np.nan
-            roll_hi = ind["h"][start:i].max() if i > start else np.nan
-            h_i = ind["h"][i]; l_i = ind["l"][i]; c_i = ind["c"][i]
-
-            bull_gen   = (not np.isnan(roll_lo)) and (l_i < roll_lo - mult*atr) and (c_i > roll_lo)
-            bear_gen   = (not np.isnan(roll_hi)) and (h_i > roll_hi + mult*atr) and (c_i < roll_hi)
-            ahi = sc_asian_hi[i]; alo = sc_asian_lo[i]
-            has_range  = not (np.isnan(ahi) or np.isnan(alo))
-            bull_asian = has_range and (l_i < alo - mult*atr*0.5) and (c_i > alo)
-            bear_asian = has_range and (h_i > ahi + mult*atr*0.5) and (c_i < ahi)
-            sweep_bull = bull_gen or bull_asian
-            sweep_bear = bear_gen or bear_asian
-
-            disp_bull, disp_bear       = compute_displacement_flags(ind, i)
-            prev_sweep_bull, prev_sweep_bear = prev_sweep
-
-            # ── Exit ──────────────────────────────────────────────────────
-            if in_position:
-                hold_count += 1
-                adverse = (ind["c"][i] < ind["o"][i]) if trade_dir == "long" \
-                          else (ind["c"][i] > ind["o"][i])
-                consec_adverse = (consec_adverse + 1) if adverse else 0
-
-                vwap_exit = False
-                if i >= 1 and hold_count >= 3:
-                    cv = ind["vwap"][i]; pv = ind["vwap"][i-1]
-                    cc = ind["c"][i];   pc = ind["c"][i-1]
-                    if trade_dir == "long"  and (cc < cv) and (pc >= pv): vwap_exit = True
-                    if trade_dir == "short" and (cc > cv) and (pc <= pv): vwap_exit = True
-
-                if (hold_count >= MAX_HOLD or
-                        not ind["in_window"][i] or
-                        (consec_adverse >= 3 and hold_count >= 3) or
-                        vwap_exit):
-                    in_position    = False
-                    hold_count     = 0
-                    consec_adverse = 0
-                    trade_dir      = None
-
-            # ── Entry — no cooldown, no session cap ───────────────────────
-            if not in_position:
-                long_cond  = (sweep_bull and disp_bull) or (prev_sweep_bull and disp_bull)
-                short_cond = (sweep_bear and disp_bear) or (prev_sweep_bear and disp_bear)
-
-                can_trade = (
-                    ind["in_window"][i] and
-                    (ind["rvol_30"][i] <= ind[f"rvol_q{vq}"][i]) and
-                    (ind["bar_range"][i] <= ind[f"spread_q{sq}"][i]) and
-                    (long_cond or short_cond) and
-                    not (long_cond and short_cond)
-                )
-
-                if can_trade:
-                    count         += 1
-                    in_position    = True
-                    hold_count     = 0
-                    consec_adverse = 0
-                    trade_dir      = "long" if long_cond else "short"
-
-            prev_sweep = (sweep_bull, sweep_bear)
-
-        self.counts[sym]   = count
-        self.bar_from[sym] = pd.Timestamp(ind["times"][0])
-        self.bar_to[sym]   = pd.Timestamp(ind["times"][-1])
-
-    def increment_live(self, sym):
-        self.live_counts[sym] += 1
-
-    def report(self):
-        sep = "=" * 65
-        logger.info(f"\n{sep}")
-        logger.info("[SIGNAL FREQUENCY REPORT — VIGINTILLION v3 (no cooldown / no cap)]")
-        logger.info(f"  Engine started : {self.engine_start.strftime('%Y-%m-%d %H:%M UTC')}")
-        logger.info(f"{'─'*65}")
-        logger.info(
-            f"  {'Symbol':<8}  {'From':<12}  {'To':<12}  "
-            f"{'Signals':>8}  {'Weeks':>6}  {'Avg/wk':>7}  {'Live':>5}"
-        )
-        logger.info(f"{'─'*65}")
-        total_hist = 0; total_live = 0
-        for sym in self.symbols:
-            hist = self.counts[sym];  live = self.live_counts[sym]
-            frm  = self.bar_from[sym]; to  = self.bar_to[sym]
-            if frm is not None and to is not None:
-                days  = max((to - frm).total_seconds() / 86400, 1)
-                weeks = days / 7.0
-                avg_w = hist / weeks if weeks > 0 else 0.0
-                frm_s = frm.strftime("%Y-%m-%d"); to_s = to.strftime("%Y-%m-%d")
-            else:
-                weeks = 0.0; avg_w = 0.0; frm_s = "N/A"; to_s = "N/A"
-            logger.info(
-                f"  {sym:<8}  {frm_s:<12}  {to_s:<12}  "
-                f"{hist:>8}  {weeks:>6.1f}  {avg_w:>7.2f}  {live:>5}"
-            )
-            total_hist += hist; total_live += live
-        logger.info(f"{'─'*65}")
-        logger.info(f"  {'TOTAL':<8}  {'':12}  {'':12}  {total_hist:>8}  {'':>6}  {'':>7}  {total_live:>5}")
-        logger.info(sep)
-
+return {
+    "n": n, "o": o, "h": h, "l": l, "c": c, "sp": sp,
+    "atr": atr, "body": body, "bar_range": bar_range,
+    "med_body": med_body, "med_range": med_range,
+    "mod": mod, "dt": dt,
+    "asia_mask": asia_mask, "london_mask": london_mask,
+    "ny_mask": ny_mask, "rollover": rollover,
+    "a_hi": a_hi, "a_lo": a_lo, "a_rng": a_rng, "a_pct": a_pct,
+    "ldn_move": ldn_move, "ldn_mpct": ldn_mpct,
+    "log_ret": log_ret,
+    "times": df["time"].values,
+}
+```
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 10 — DATA FETCH
-# ══════════════════════════════════════════════════════════════════════════════
 
-def fetch_bars(symbol, n=FETCH_BARS):
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, n + 1)
-    if rates is None:
-        err  = mt5.last_error()
-        info = mt5.symbol_info(symbol)
-        info_str = (
-            f"visible={info.visible}  trade_mode={info.trade_mode}  "
-            f"spread={info.spread}  digits={info.digits}  path={info.path}"
-        ) if info else "symbol_info=None (symbol unknown to terminal)"
-        logger.warning(
-            f"[{symbol}] fetch returned None — "
-            f"error=({err[0]}, '{err[1]}') | {info_str}"
-        )
-        return None
-    if len(rates) < 50:
-        logger.warning(f"[{symbol}] only {len(rates)} bars")
-        return None
-    df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s")
-    return df.iloc[:-1]   # drop forming bar
-
+# PARAM-DEPENDENT RECOMPUTE  (called once per global param combo)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 10b — BAR CLOCK
-# ══════════════════════════════════════════════════════════════════════════════
 
-def get_last_closed_bar_time():
-    rates = mt5.copy_rates_from_pos(SYMBOLS[0], mt5.TIMEFRAME_M1, 0, 2)
-    if rates is not None and len(rates) >= 2:
-        return pd.Timestamp(rates[1]["time"], unit="s")
-    return None
+def compute_regimes_and_eff(base, rv_w, eff_w):
+n      = base[“n”]
+c      = base[“c”]
+lr     = base[“log_ret”]
 
+```
+# Realized volatility: sqrt(sum of squared log returns over rv_w bars)
+rv_raw = np.sqrt(np.maximum(
+    pd.Series(lr ** 2).rolling(rv_w, min_periods=rv_w // 2).sum().values, 0.0))
 
-def wait_for_new_bar(last_bar_time):
-    while True:
-        t = get_last_closed_bar_time()
-        if t is not None and t > last_bar_time:
-            return t
-        time.sleep(5)
+# Rolling historical percentile — expanding, no lookahead
+# Insert every 5th bar to keep the sorted list O(log n) manageable
+rv_pct    = np.full(n, 50.0)
+sorted_rv = []
+warmup    = max(rv_w * 3, 500)
+for i in range(n):
+    if i >= warmup and len(sorted_rv) > 0:
+        rv_pct[i] = bisect.bisect_left(sorted_rv, rv_raw[i]) / len(sorted_rv) * 100
+    if i % 5 == 0:
+        bisect.insort(sorted_rv, rv_raw[i])
 
+rl  = rv_pct < RV_LOW_PCT
+rm  = (rv_pct >= RV_MED_LO) & (rv_pct <= RV_MED_HI)
+rh  = rv_pct > RV_HIGH_PCT
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 11 — PROCESS ONE SYMBOL PER BAR
-# ══════════════════════════════════════════════════════════════════════════════
+# Directional efficiency ratio
+shifted = pd.Series(c).shift(eff_w).values
+net     = np.abs(c - shifted)
+gross   = pd.Series(
+    np.abs(np.diff(c, prepend=c[0]))
+).rolling(eff_w, min_periods=2).sum().values
+with np.errstate(divide="ignore", invalid="ignore"):
+    eff = np.where(gross > 0, net / gross, 0.0)
 
-def process_symbol(sym, sym_st, metrics, sig_counter, balance, bar_count):
-    df = fetch_bars(sym)
-    if df is None:
-        return
-
-    ind = compute_indicators(df)
-    i   = len(ind["c"]) - 1
-
-    sym_st["asian"].update(df["time"].iloc[-1], df["high"].iloc[-1], df["low"].iloc[-1])
-    asian_hi, asian_lo = sym_st["asian"].get()
-
-    # ── Broker cross-check ────────────────────────────────────────────────
-    positions = mt5.positions_get(symbol=sym)
-    positions = [p for p in positions if p.magic == MAGIC] if positions else []
-
-    if positions and sym_st["state"] == STATE_FLAT:
-        logger.warning(f"[{sym}] Broker has position but state=FLAT — correcting")
-        sym_st["trade_state"] = reconstruct_state(sym, positions[0], df)
-        sym_st["state"]       = STATE_IN_POSITION
-
-    elif not positions and sym_st["state"] == STATE_IN_POSITION:
-        logger.info(f"[{sym}] Position closed server-side (SL/TP)")
-        if sym_st["trade_state"]:
-            deals = mt5.history_deals_get(position=sym_st["trade_state"].get("ticket", 0))
-            if deals and len(deals) >= 2:
-                ep        = sym_st["trade_state"]["entry_price"]
-                sl_dist   = sym_st["trade_state"]["sl_dist"]
-                direction = sym_st["trade_state"]["direction"]
-                close_p   = deals[-1].price
-                sign      = 1 if direction == "long" else -1
-                r_mult    = sign * (close_p - ep) / sl_dist if sl_dist > 0 else 0.0
-            else:
-                r_mult = 0.0
-            metrics.record(sym, r_mult, balance)
-            logger.info(f"[{sym}] TRADE CLOSED (server): R={r_mult:+.3f}")
-        sym_st["state"]       = STATE_FLAT
-        sym_st["trade_state"] = None
-
-    # ── Entry (only when FLAT) ────────────────────────────────────────────
-    if sym_st["state"] == STATE_FLAT:
-        direction, sl_price, rr, new_sweep = check_entry_signal(
-            ind, asian_hi, asian_lo, sym_st["prev_sweep"]
-        )
-
-        # Always update prev_sweep
-        if new_sweep is not None:
-            sym_st["prev_sweep"] = new_sweep
-        else:
-            p     = BEST_PARAMS
-            N     = p["sweep_lookback"]; mult = p["sweep_atr_mult"]
-            atr   = ind["atr14"][i]
-            start = max(0, i - N)
-            roll_lo = ind["l"][start:i].min() if i > start else np.nan
-            roll_hi = ind["h"][start:i].max() if i > start else np.nan
-            h_i = ind["h"][i]; l_i = ind["l"][i]; c_i = ind["c"][i]
-            has_range = not (np.isnan(asian_hi) or np.isnan(asian_lo))
-            bull = ((not np.isnan(roll_lo)) and (l_i < roll_lo - mult*atr) and (c_i > roll_lo)) or \
-                   (has_range and (l_i < asian_lo - mult*atr*0.5) and (c_i > asian_lo))
-            bear = ((not np.isnan(roll_hi)) and (h_i > roll_hi + mult*atr) and (c_i < roll_hi)) or \
-                   (has_range and (h_i > asian_hi + mult*atr*0.5) and (c_i < asian_hi))
-            sym_st["prev_sweep"] = (bull, bear)
-
-        if direction is not None:
-            sig_counter.increment_live(sym)
-            sig_counter.report()
-
-            # Re-check broker — avoid double entry
-            positions = mt5.positions_get(symbol=sym)
-            positions = [p for p in positions if p.magic == MAGIC] if positions else []
-            if positions:
-                logger.warning(f"[{sym}] Skipping entry — position already exists")
-            else:
-                c_last   = df["close"].iloc[-1]
-                lot      = compute_lot_size(sym, c_last, sl_price, balance)
-                if lot is None:
-                    logger.error(f"[{sym}] Lot calc failed")
-                else:
-                    sl_dist  = abs(c_last - sl_price)
-                    tp_price = (c_last + sl_dist * rr) if direction == "long" \
-                               else (c_last - sl_dist * rr)
-                    result   = send_entry_order(sym, direction, sl_price, tp_price, lot)
-                    if result:
-                        time.sleep(0.5)
-                        pos_new = mt5.positions_get(symbol=sym)
-                        pos_new = [p for p in pos_new if p.magic == MAGIC] if pos_new else []
-                        if pos_new:
-                            ap          = pos_new[0].price_open
-                            actual_sl   = pos_new[0].sl
-                            actual_tp   = pos_new[0].tp
-                            actual_dist = abs(ap - actual_sl)
-                        else:
-                            ap = c_last; actual_sl = sl_price
-                            actual_tp = tp_price; actual_dist = sl_dist
-
-                        sym_st["trade_state"] = {
-                            "direction":      direction,
-                            "entry_price":    ap,
-                            "sl_price":       actual_sl,
-                            "tp_price":       actual_tp,
-                            "sl_dist":        actual_dist,
-                            "lot":            lot,
-                            "hold_count":     0,
-                            "consec_adverse": 0,
-                            "ticket":         result.order,
-                        }
-                        sym_st["state"] = STATE_IN_POSITION
-
-    # ── Exit (only when IN_POSITION) ──────────────────────────────────────
-    elif sym_st["state"] == STATE_IN_POSITION:
-        should_exit = check_early_exit(ind, sym_st["trade_state"], sym)
-        if should_exit:
-            positions = mt5.positions_get(symbol=sym)
-            positions = [p for p in positions if p.magic == MAGIC] if positions else []
-            if positions:
-                closed = send_close_order(sym, positions[0])
-                if closed:
-                    close_p = df["close"].iloc[-1]
-                    ep      = sym_st["trade_state"]["entry_price"]
-                    sl_dist = sym_st["trade_state"]["sl_dist"]
-                    sign    = 1 if sym_st["trade_state"]["direction"] == "long" else -1
-                    r_mult  = sign * (close_p - ep) / sl_dist if sl_dist > 0 else 0.0
-                    metrics.record(sym, r_mult, balance)
-                    logger.info(f"[{sym}] TRADE CLOSED (early): R={r_mult:+.3f}")
-                    sym_st["state"]       = STATE_FLAT
-                    sym_st["trade_state"] = None
-            else:
-                sym_st["state"]       = STATE_FLAT
-                sym_st["trade_state"] = None
-
+return rl, rm, rh, eff
+```
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 12 — MAIN LOOP
+
+# SIGNAL DETECTORS — vectorized, signal on bar i, entry on bar i+1
+
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_live():
-    if not mt5.initialize(path=TERMINAL_PATH, login=LOGIN, password=PASSWORD, server=SERVER):
-        raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+def detect_m1(base, regime_med, eff, eff_thr, pm):
+“”“London Liquidity Expansion”””
+c   = base[“c”]; o = base[“o”]
+atr = base[“atr”]
+body = base[“body”]; med_body = base[“med_body”]
+a_hi = base[“a_hi”]; a_lo = base[“a_lo”]
+a_rng = base[“a_rng”]; a_pct = base[“a_pct”]
+win  = base[“london_mask”]
 
-    acct = mt5.account_info()
-    logger.info(f"MT5 connected | account={acct.login} | balance={acct.balance:.2f}")
-    logger.info(f"Symbols: {SYMBOLS}")
-    logger.info(f"BEST_PARAMS: {BEST_PARAMS}")
-    logger.info(f"RISK_PER_TRADE: {RISK_PER_TRADE:.1%} per symbol")
-    logger.info(f"NO cooldown | NO session cap")
-    logger.info("=" * 60)
+```
+valid = (win
+         & regime_med
+         & (eff >= eff_thr)
+         & ~np.isnan(a_hi)
+         & ~np.isnan(a_pct)
+         & (a_pct < pm["asia_range_pct"])       # compressed session
+         & (a_rng > 0)
+         & (body >= pm["body_mult"] * med_body)) # displacement candle
 
-    # ── Symbol diagnostic ─────────────────────────────────────────────────
-    logger.info("=== SYMBOL DIAGNOSTIC ===")
-    for sym in SYMBOLS:
-        info = mt5.symbol_info(sym)
-        if info is None:
-            all_syms   = mt5.symbols_get()
-            candidates = [s.name for s in all_syms if sym[:3] in s.name or sym[3:] in s.name] if all_syms else []
-            logger.warning(f"  {sym}: NOT FOUND. Possible names: {candidates[:10]}")
-        else:
-            tick       = mt5.symbol_info_tick(sym)
-            rates_test = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, 5)
-            logger.info(
-                f"  {sym}: visible={info.visible}  trade_mode={info.trade_mode}  "
-                f"spread={info.spread}  digits={info.digits}  "
-                f"tick={'OK' if tick else 'None'}  "
-                f"bars_test={'OK len='+str(len(rates_test)) if rates_test is not None else 'None — '+str(mt5.last_error())}  "
-                f"path={info.path}"
-            )
-    logger.info("=== END DIAGNOSTIC ===")
+long_s  = valid & (c > a_hi)
+short_s = valid & (c < a_lo)
 
-    sym_states  = {s: make_sym_state() for s in SYMBOLS}
-    metrics     = Metrics(SYMBOLS)
-    sig_counter = SignalCounter(SYMBOLS)
-    bar_count   = 0
+n    = base["n"]
+dirs = np.zeros(n, dtype=np.int8)
+dirs[long_s]  = 1
+dirs[short_s] = -1
 
-    # ── Startup signal frequency scan ─────────────────────────────────────
-    logger.info("=== SCANNING HISTORY FOR SIGNAL FREQUENCY ===")
-    for sym in SYMBOLS:
-        df_hist = fetch_bars(sym, FETCH_BARS)
-        sig_counter.scan_history(sym, df_hist)
-    sig_counter.report()
-    logger.info("=== END SIGNAL FREQUENCY SCAN ===")
+buf  = pm["stop_buffer_atr"]
+sl   = np.full(n, np.nan)
+sl[long_s]  = a_lo[long_s]  - buf * atr[long_s]
+sl[short_s] = a_hi[short_s] + buf * atr[short_s]
 
-    # ── Startup position recovery ─────────────────────────────────────────
-    for sym in SYMBOLS:
-        positions = mt5.positions_get(symbol=sym)
-        if positions:
-            for pos in positions:
-                if pos.magic == MAGIC:
-                    df_init = fetch_bars(sym, 200)
-                    if df_init is not None:
-                        sym_states[sym]["trade_state"] = reconstruct_state(sym, pos, df_init)
-                        sym_states[sym]["state"]       = STATE_IN_POSITION
-                        logger.info(f"[{sym}] STARTUP: recovered open position")
-                    break
+# TP distance array (per bar)
+tp_dist = a_rng * pm["tp_mult"]   # element-wise; index by sig_idx in backtest
 
-    # ── Seed bar clock ────────────────────────────────────────────────────
-    last_bar_time = get_last_closed_bar_time()
-    if last_bar_time is None:
-        last_bar_time = pd.Timestamp.utcnow()
-    logger.info(f"Seeded bar time: {last_bar_time} — waiting for next bar close...")
+return dirs, sl, ("fixed_dist", tp_dist)
+```
 
-    while True:
-        try:
-            new_bar_time  = wait_for_new_bar(last_bar_time)
-            last_bar_time = new_bar_time
-            bar_count    += 1
+def detect_m2(base, regime_high, eff, eff_thr, pm):
+“”“NY Trend Exhaustion Reversal”””
+c = base[“c”]; o = base[“o”]; h = base[“h”]; l = base[“l”]
+atr      = base[“atr”]
+body     = base[“body”]
+ldn_move = base[“ldn_move”]
+ldn_mpct = base[“ldn_mpct”]
+win      = base[“ny_mask”]
 
-            logger.info(f"── BAR {bar_count} | {new_bar_time} ──────────────────────")
+```
+has_move    = ~np.isnan(ldn_move) & ~np.isnan(ldn_mpct)
+strong_move = has_move & (ldn_mpct >= pm["ldn_move_pct"])
+bull_london = strong_move & (ldn_move > 0)
+bear_london = strong_move & (ldn_move < 0)
 
-            balance = mt5.account_info().balance
+upper_wick = h - np.maximum(o, c)
+lower_wick = np.minimum(o, c) - l
+safe_body  = np.maximum(body, 1e-9)
 
-            for sym in SYMBOLS:
-                process_symbol(sym, sym_states[sym], metrics, sig_counter, balance, bar_count)
+bear_rej = (bull_london
+            & (c < o)
+            & (upper_wick >= pm["wick_mult"] * safe_body))
+bull_rej = (bear_london
+            & (c > o)
+            & (lower_wick >= pm["wick_mult"] * safe_body))
 
-            metrics.check_hourly(balance)
+valid_s = win & regime_high & (eff >= eff_thr) & bear_rej
+valid_l = win & regime_high & (eff >= eff_thr) & bull_rej
 
-        except KeyboardInterrupt:
-            logger.info("Shutdown — exiting")
-            break
-        except Exception as e:
-            logger.exception(f"Main loop error: {e}")
-            time.sleep(30)
+n    = base["n"]
+dirs = np.zeros(n, dtype=np.int8)
+dirs[valid_l] = 1
+dirs[valid_s] = -1
 
-    mt5.shutdown()
-    logger.info("Disconnected. Engine stopped.")
-    metrics.hourly_report(mt5.account_info().balance if mt5.account_info() else 0)
+buf  = pm["stop_buffer_atr"]
+sl   = np.full(n, np.nan)
+sl[valid_l] = l[valid_l] - buf * atr[valid_l]
+sl[valid_s] = h[valid_s] + buf * atr[valid_s]
 
+return dirs, sl, ("sl_mult", pm["tp_multiple"])
+```
 
-if __name__ == "__main__":
-    run_live()
+def detect_m3(base, regime_low, eff, eff_thr, pm):
+“”“Volatility Compression Breakout”””
+c = base[“c”]; h = base[“h”]; l = base[“l”]
+atr       = base[“atr”]
+bar_range = base[“bar_range”]
+med_range = base[“med_range”]
+rollover  = base[“rollover”]
+
+```
+lkbk = pm["box_lookback"]
+# shift(1) on rolling window: box uses data up to bar i-1, no lookahead
+box_h = pd.Series(h).rolling(lkbk, min_periods=lkbk // 2).max().shift(1).values
+box_l = pd.Series(l).rolling(lkbk, min_periods=lkbk // 2).min().shift(1).values
+box_r = box_h - box_l
+
+valid_base = (~rollover
+              & regime_low
+              & (eff >= eff_thr)
+              & ~np.isnan(box_h)
+              & (box_r > 0)
+              & (box_r <= pm["box_atr_ratio"] * atr)
+              & (bar_range >= pm["expansion_mult"] * med_range))
+
+long_s  = valid_base & (c > box_h)
+short_s = valid_base & (c < box_l)
+
+n    = base["n"]
+dirs = np.zeros(n, dtype=np.int8)
+dirs[long_s]  = 1
+dirs[short_s] = -1
+
+box_mid = (box_h + box_l) / 2.0
+sl      = np.full(n, np.nan)
+sl[long_s]  = box_mid[long_s]
+sl[short_s] = box_mid[short_s]
+
+return dirs, sl, ("box_mult", box_r, pm["tp_mult"])
+```
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# VECTORIZED BACKTEST
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+def backtest_vec(base, dirs, sl_arr, tp_info, fixed_spread, model_id,
+regime_low, regime_med, regime_high):
+n     = base[“n”]
+o     = base[“o”]; h = base[“h”]; l = base[“l”]; c = base[“c”]
+sp    = base[“sp”]
+times = base[“times”]
+
+```
+sig_idx = np.where(dirs != 0)[0]
+sig_idx = sig_idx[sig_idx + 1 < n]
+if len(sig_idx) == 0:
+    return None, []
+
+ei  = sig_idx + 1                  # entry bar — no lookahead
+d   = dirs[sig_idx]
+
+# Spread-aware entry price
+sp_e = np.where(np.isnan(sp[ei]), fixed_spread, sp[ei])
+ep   = np.where(d == 1, o[ei] + sp_e / 2.0,
+                         o[ei] - sp_e / 2.0)
+
+sl_p     = sl_arr[sig_idx]
+sl_dist  = np.maximum(np.abs(ep - sl_p), 1e-9)
+
+# Target price
+tp_type = tp_info[0]
+if tp_type == "fixed_dist":
+    tp_dist_full = tp_info[1]   # full-length array indexed by sig_idx
+    tp_d = tp_dist_full[sig_idx]
+    tp_p = np.where(d == 1, ep + tp_d, ep - tp_d)
+elif tp_type == "sl_mult":
+    mult = tp_info[1]
+    tp_p = np.where(d == 1, ep + sl_dist * mult, ep - sl_dist * mult)
+else:  # "box_mult"
+    box_r_full = tp_info[1]; mult = tp_info[2]
+    br   = box_r_full[sig_idx]
+    tp_p = np.where(d == 1, ep + br * mult, ep - br * mult)
+
+nt        = len(sig_idx)
+hold_caps = np.full(nt, MAX_HOLD_BARS, dtype=np.int32)   # uniform cap (no session boundary here)
+max_cap   = MAX_HOLD_BARS
+
+offsets = np.arange(max_cap)
+abs_i   = np.clip(ei[:, None] + offsets[None, :], 0, n - 1)  # (nt, max_cap)
+
+fut_h  = h[abs_i]; fut_l = l[abs_i]; fut_c = c[abs_i]
+sp_fwd = np.where(np.isnan(sp[abs_i]), fixed_spread, sp[abs_i])
+
+# off_mask: True only for valid offsets within each trade's hold cap
+off_mask = offsets[None, :] < hold_caps[:, None]             # (nt, max_cap)
+
+# SL hit: long uses low (bid), short uses high (ask) — intra-bar wick touches
+sl_hit = np.where(d[:, None] == 1,
+                  fut_l <= sl_p[:, None],
+                  fut_h + sp_fwd >= sl_p[:, None]) & off_mask
+# TP hit: long uses high (bid reaches target), short uses low (ask reaches target)
+tp_hit = np.where(d[:, None] == 1,
+                  fut_h >= tp_p[:, None],
+                  fut_l + sp_fwd <= tp_p[:, None]) & off_mask
+
+any_exit = sl_hit | tp_hit
+first    = np.argmax(any_exit, axis=1)
+hit      = any_exit[np.arange(nt), first]
+exit_off = np.where(hit, first, hold_caps - 1)
+
+at_sl  = sl_hit[np.arange(nt), exit_off]
+at_tp  = tp_hit[np.arange(nt), exit_off]
+exit_c = fut_c[np.arange(nt), exit_off]
+
+raw_r    = np.clip((exit_c - ep) / sl_dist * d, -2.0, 4.0)
+tp_rr    = np.abs(tp_p - ep) / sl_dist
+result_r = np.where(at_sl, -1.0, np.where(at_tp, tp_rr, raw_r))
+
+# Regime label per trade
+reg = np.where(regime_low[sig_idx],  "low",
+      np.where(regime_med[sig_idx],  "med",
+      np.where(regime_high[sig_idx], "high", "neutral")))
+
+trades = []
+for k in range(nt):
+    trades.append({
+        "timestamp":         str(times[ei[k]]),
+        "model_id":          model_id,
+        "direction":         "long" if d[k] == 1 else "short",
+        "entry_price":       round(float(ep[k]),    6),
+        "stop_price":        round(float(sl_p[k]),  6),
+        "target_price":      round(float(tp_p[k]),  6),
+        "spread_used":       round(float(sp_e[k]),  6),
+        "volatility_regime": str(reg[k]),
+        "result_r":          round(float(result_r[k]), 4),
+    })
+
+if len(trades) < MIN_TRADES:
+    return None, trades
+
+rr   = result_r
+wins = rr > 0
+tt   = len(rr)
+wr   = wins.sum() / tt
+wr_  = float(rr[wins].sum())
+lr_  = float(np.abs(rr[~wins].sum())) if (~wins).sum() > 0 else 1.0
+nw   = wins.sum(); nl = (~wins).sum()
+exp  = wr * (wr_ / nw if nw else 0) - (1 - wr) * (lr_ / nl if nl else 1)
+pf   = wr_ / lr_ if lr_ > 0 else 999.0
+
+bal  = 10_000.0; bals = [bal]
+for r in rr:
+    bal = bal * (1 + RISK_PER_TRADE * r) if r > 0 \
+          else bal * (1 - RISK_PER_TRADE * abs(r))
+    bals.append(bal)
+bals = np.array(bals)
+rm   = np.maximum.accumulate(bals)
+dd   = rm - bals
+mdd  = float(dd.max() / rm[np.argmax(dd)]) if len(bals) > 1 else 0.0
+
+t0  = pd.Timestamp(times[0]); t1 = pd.Timestamp(times[-1])
+wks = max((t1 - t0).total_seconds() / 604_800, 1.0)
+
+return {
+    "total_trades":     tt,
+    "win_rate":         round(wr,  4),
+    "expectancy_r":     round(exp, 4),
+    "profit_factor":    round(pf,  3),
+    "max_drawdown":     round(mdd, 4),
+    "trades_per_week":  round(tt / wks, 2),
+}, trades
+```
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# GRID RUNNER
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_model_grid(model_id, detect_fn, grid_m, base_caches):
+keys_g   = list(GRID_GLOBAL.keys())
+keys_m   = list(grid_m.keys())
+combos_g = list(itertools.product(*[GRID_GLOBAL[k] for k in keys_g]))
+combos_m = list(itertools.product(*[grid_m[k]      for k in keys_m]))
+total    = len(combos_g) * len(combos_m)
+fixed_sp = 0.0002
+
+```
+all_rows   = []
+all_trades = []
+
+for sym, base in base_caches.items():
+    pb = Bar(total, prefix=f"  M{model_id} {sym}")
+
+    for g_vals in combos_g:
+        pg   = dict(zip(keys_g, g_vals))
+        rv_w = pg["rv_window"]
+        ew   = pg["efficiency_window"]
+        ethr = pg["efficiency_threshold"]
+
+        rl, rm, rh, eff = compute_regimes_and_eff(base, rv_w, ew)
+
+        for m_vals in combos_m:
+            pm = dict(zip(keys_m, m_vals))
+
+            try:
+                regime_for_model = (rm if model_id == 1
+                                    else rh if model_id == 2
+                                    else rl)
+                dirs, sl_arr, tp_info = detect_fn(
+                    base, regime_for_model, eff, ethr, pm)
+                stats, trades = backtest_vec(
+                    base, dirs, sl_arr, tp_info,
+                    fixed_sp, model_id, rl, rm, rh)
+            except Exception:
+                stats = None; trades = []
+
+            if stats is not None:
+                row = {**pg, **pm, "symbol": sym, **stats}
+                all_rows.append(row)
+                for t in trades:
+                    t["symbol"] = sym
+                all_trades.extend(trades)
+
+            pb.step()
+
+return all_rows, all_trades
+```
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# SUMMARY PRINTER
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+def print_top(agg, model_id, keys_m, top=10):
+sep = “─” * 92
+logger.info(f”\n{’=’*60}”)
+logger.info(f”MODEL {model_id} — TOP {top}  (mean expectancy across all symbols)”)
+logger.info(sep)
+for i, row in agg.head(top).iterrows():
+ps = “  “.join(f”{k}={row[k]}” for k in (list(GRID_GLOBAL.keys()) + keys_m))
+logger.info(
+f”  #{i+1:<3} WR={row[‘win_rate’]:.1%}  E={row[‘expectancy_r’]:+.3f}  “
+f”PF={row[‘profit_factor’]:.2f}  MDD={row[‘max_drawdown’]:.1%}  “
+f”T/wk={row[‘trades_per_week’]:.1f}”
+)
+logger.info(f”       {ps}”)
+if len(agg):
+best = agg.iloc[0]
+logger.info(f”\n  ★ BEST COMBO MODEL {model_id}”)
+for k in list(GRID_GLOBAL.keys()) + keys_m:
+logger.info(f”    {k:<28}: {best[k]}”)
+logger.info(f”    {‘win_rate’:<28}: {best[‘win_rate’]:.1%}”)
+logger.info(f”    {‘expectancy_r’:<28}: {best[‘expectancy_r’]:+.4f}R”)
+logger.info(f”    {‘profit_factor’:<28}: {best[‘profit_factor’]:.3f}”)
+logger.info(f”    {‘max_drawdown’:<28}: {best[‘max_drawdown’]:.2%}”)
+logger.info(f”    {‘trades_per_week’:<28}: {best[‘trades_per_week’]:.1f}”)
+logger.info(sep)
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# MAIN
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+if not MT5_AVAILABLE:
+raise RuntimeError(“MetaTrader5 package not found.”)
+if not mt5.initialize(path=TERMINAL_PATH, login=LOGIN,
+password=PASSWORD, server=SERVER):
+raise RuntimeError(f”MT5 init failed: {mt5.last_error()}”)
+
+```
+logger.info("=" * 70)
+logger.info("MULTI-MODEL FX ENGINE — VECTORIZED GRID SEARCH")
+logger.info(f"M1 combos: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M1):,}  "
+            f"M2: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M2):,}  "
+            f"M3: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M3):,}  (all ≤20K)")
+logger.info("No lookahead: signal bar i → entry open[i+1]")
+logger.info("Spread-aware: long=open+sp/2  short=open-sp/2")
+logger.info("=" * 70)
+
+# Fetch
+base_caches = {}
+for sym in SYMBOLS:
+    logger.info(f"\n[{sym}] fetching...")
+    df = fetch(sym)
+    if df is not None:
+        logger.info(f"[{sym}] building cache...")
+        base_caches[sym] = build_base_cache(df)
+
+mt5.shutdown()
+if not base_caches:
+    logger.error("No data fetched. Aborting."); return
+
+# Models
+model_defs = [
+    (1, detect_m1, GRID_M1, list(GRID_M1.keys())),
+    (2, detect_m2, GRID_M2, list(GRID_M2.keys())),
+    (3, detect_m3, GRID_M3, list(GRID_M3.keys())),
+]
+
+for model_id, detect_fn, grid_m, keys_m in model_defs:
+    logger.info(f"\n{'='*60}")
+    logger.info(f"RUNNING MODEL {model_id} — {len(base_caches)} symbols")
+    rows, trades = run_model_grid(model_id, detect_fn, grid_m, base_caches)
+
+    if not rows:
+        logger.warning(f"  Model {model_id}: zero valid combos — "
+                       f"consider loosening thresholds")
+        continue
+
+    df_full = pd.DataFrame(rows)
+    df_full.to_csv(f"mme_m{model_id}_grid.csv", index=False)
+
+    if trades:
+        pd.DataFrame(trades).to_csv(
+            f"mme_m{model_id}_trades.csv", index=False)
+        logger.info(f"  {len(trades):,} trades → mme_m{model_id}_trades.csv")
+
+    agg_keys = list(GRID_GLOBAL.keys()) + keys_m
+    agg = df_full.groupby(agg_keys).agg(
+        symbols_valid   = ("symbol",          "count"),
+        win_rate        = ("win_rate",         "mean"),
+        expectancy_r    = ("expectancy_r",     "mean"),
+        profit_factor   = ("profit_factor",    "mean"),
+        max_drawdown    = ("max_drawdown",     "mean"),
+        trades_per_week = ("trades_per_week",  "mean"),
+    ).reset_index()
+
+    agg = agg[agg["symbols_valid"] == len(base_caches)]
+    agg = agg.sort_values("expectancy_r", ascending=False).reset_index(drop=True)
+    agg.to_csv(f"mme_m{model_id}_agg.csv", index=False)
+    logger.info(f"  Grid agg → mme_m{model_id}_agg.csv  "
+                f"({len(agg)} valid combos across all symbols)")
+
+    print_top(agg, model_id, keys_m)
+
+logger.info(f"\n{'='*70}")
+logger.info("COMPLETE. Best params per model in mme_m1/m2/m3_agg.csv")
+logger.info("=" * 70)
+```
+
+if **name** == “**main**”:
+main()
