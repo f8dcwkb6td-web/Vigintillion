@@ -1,31 +1,32 @@
 """
 ==============================================================================
-MULTI-MODEL FX STRATEGY ENGINE  |  M1  |  VECTORIZED  |  NO LOOKAHEAD
+Multi-Pair Edge Validation  |  14 Pairs  |  M1  |  2.5M bars
 ==============================================================================
-Model 1 : London Liquidity Expansion        (medium vol regime, 07:00-10:00 UTC)
-Model 2 : New York Trend Exhaustion         (high vol regime,   12:30-15:00 UTC)
-Model 3 : Volatility Compression Breakout   (low vol regime,    excl rollover)
+VALIDATES TWO EDGES ACROSS ALL 14 PAIRS WITH FIXED PARAMS:
 
-Rules
-  - Signal detected at close of bar i using ONLY data[0..i]
-  - Entry price  = open[i+1]  (no lookahead)
-  - SL/TP triggers: long uses low/high, short uses high/low — intra-bar wick
-  - Session windows hardcoded in BROKER hours (IC Markets GMT+2 fixed offset)
-      Asia    : broker 02:00–08:00  →  UTC 00:00–06:00
-      London  : broker 09:00–12:00  →  UTC 07:00–10:00
-      New York: broker 14:30–17:00  →  UTC 12:30–15:00
-      Rollover: broker 01:00–03:00  →  UTC 23:00–01:00
-  - Grid <= 20,000 combos per model
+  EDGE A — FIX_WINDOW (4pm London WM/Reuters Fix)
+    Params: vq=q70 sq=q30 slb=5 sam=0.1 bam=0.5 vm=2.0 buf=0.2 rr=2.0
+    Validated on USDJPY: n=159 WR=79.9% E=+1.377 MDD=1.0%
 
-Outputs
-  mme_m{1,2,3}_trades.csv  — every trade with all required fields
-  mme_m{1,2,3}_grid.csv    — full grid results per symbol
-  mme_m{1,2,3}_agg.csv     — aggregated results across all symbols
-  multi_model_engine.log   — full run log
+  EDGE B — MONDAY_ASIA (Monday Asia Open)
+    Params: vq=q60 sq=q30 slb=5 sam=0.3 bam=0.5 vm=2.0 buf=0.2 rr=2.0
+    Validated on USDJPY: n=248 WR=71.8% E=+1.144 MDD=1.0%
+
+PURPOSE:
+  Overfit defense — if same fixed params produce 70%+ WR across uncorrelated
+  pairs, curve fitting is mathematically impossible.
+
+OUTPUT PER EDGE:
+  - Results table sorted by Expectancy
+  - Correlation matrix of R-multiples
+  - Most uncorrelated pairs
+  - Combined portfolio trade count
+
+BARS: 2.5M per pair
 ==============================================================================
 """
 
-import os, sys, io, logging, itertools, time, bisect, datetime
+import os, sys, io, logging, datetime
 import numpy as np
 import pandas as pd
 from logging.handlers import RotatingFileHandler
@@ -36,687 +37,586 @@ try:
 except ImportError:
     MT5_AVAILABLE = False
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-logger = logging.getLogger("MME")
+# ── Logging ───────────────────────────────────────────────────────────────────
+logger = logging.getLogger("EDGE_MULTI_PAIR")
 logger.setLevel(logging.INFO)
-_fh = RotatingFileHandler("multi_model_engine.log", maxBytes=20_000_000,
-                           backupCount=2, encoding="utf-8")
-_fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+_fh = RotatingFileHandler("edge_multi_pair.log", maxBytes=20_000_000, backupCount=3, encoding="utf-8")
+_fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(_fh)
-_sh = logging.StreamHandler(io.TextIOWrapper(sys.stdout.buffer,
-                             encoding="utf-8", errors="replace"))
-_sh.setFormatter(logging.Formatter("%(message)s"))
+_sh = logging.StreamHandler(io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace"))
+_sh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(_sh)
 
-# ── MT5 connection ─────────────────────────────────────────────────────────────
-TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH",
-                               r"C:\Program Files\MetaTrader 5\terminal64.exe")
-LOGIN    = int(os.environ.get("MT5_LOGIN",    0))
-PASSWORD =     os.environ.get("MT5_PASSWORD", "")
-SERVER   =     os.environ.get("MT5_SERVER",   "")
+TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH", r"C:\Program Files\MetaTrader 5\terminal64.exe")
+LOGIN         = int(os.environ.get("MT5_LOGIN", 0))
+PASSWORD      = os.environ.get("MT5_PASSWORD", "")
+SERVER        = os.environ.get("MT5_SERVER", "")
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-FETCH_BARS     = 500_000
-SYMBOLS        = ["AUDJPY", "EURJPY", "EURAUD", "GBPJPY", "USDJPY"]
-MIN_TRADES     = 50
-RISK_PER_TRADE = 0.06
-MAX_HOLD_BARS  = 120      # 2-hour hard cap
+FETCH_BARS             = 2_500_000
+MIN_TRADES             = 30
+MAX_HOLD               = 60
+VWAP_WINDOW            = 10
+SL_MULTIPLIER          = 1.0
+COOLDOWN_BARS          = 10
+MAX_TRADES_PER_SESSION = 3
+RISK_PER_TRADE         = 0.01
 
-# IC Markets broker is GMT+2 (fixed — no DST adjustment needed, we hardcode windows)
-# All session masks are expressed in BROKER hours so the raw MT5 timestamps work
-# directly without any timezone conversion.
-#
-#  Broker hour → UTC:  subtract 2
-#
-#  Asia    broker 02–08  (UTC 00–06)
-#  London  broker 09–12  (UTC 07–10)
-#  NY      broker 14:30–17  (UTC 12:30–15)
-#  Rollover broker 01–03 / 23–24 (UTC 23–01)
+PAIRS = [
+    "USDJPY", "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD",
+    "USDCAD", "USDCHF", "EURJPY", "GBPJPY", "AUDJPY",
+    "EURGBP", "EURAUD", "EURCAD", "GBPAUD",
+]
 
-# Vol regime percentile thresholds
-RV_LOW_PCT  = 40
-RV_MED_LO   = 40
-RV_MED_HI   = 60
-RV_HIGH_PCT = 80
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  GRID DEFINITION
-# ══════════════════════════════════════════════════════════════════════════════
-
-GRID_GLOBAL = {
-    "rv_window":            [120, 60],
-    "efficiency_window":    [20,  10],
-    "efficiency_threshold": [0.3, 0.2],
+# ── Hardcoded validated params per edge ──────────────────────────────────────
+EDGE_PARAMS = {
+    "FIX_WINDOW": {
+        "vol_threshold_q": "q70",
+        "spread_q":        "q30",
+        "sweep_lookback":  5,
+        "sweep_atr_mult":  0.1,
+        "body_atr_mult":   0.5,
+        "vol_mult":        2.0,
+        "buffer_atr":      0.2,
+        "rr_ratio":        2.0,
+    },
+    "MONDAY_ASIA": {
+        "vol_threshold_q": "q60",
+        "spread_q":        "q30",
+        "sweep_lookback":  5,
+        "sweep_atr_mult":  0.3,
+        "body_atr_mult":   0.5,
+        "vol_mult":        2.0,
+        "buffer_atr":      0.2,
+        "rr_ratio":        2.0,
+    },
 }
 
-GRID_M1 = {
-    "asia_range_pct":    [25, 35, 45],
-    "body_mult":         [1.5, 1.0, 0.7],
-    "tp_mult":           [3.0, 2.0, 1.5],
-    "stop_buffer_atr":   [0.2, 0.0],
+EDGES = {
+    "FIX_WINDOW": {
+        "description": "4pm London WM/Reuters Fix | 15-17 broker (13-15 UTC)",
+        "window_fn":   lambda hours, dow: ((hours >= 15) & (hours < 17)),
+        "asian_hours": (1, 9),
+    },
+    "MONDAY_ASIA": {
+        "description": "Monday Asia Open | Mon 01-09 broker (Sun 23-Mon 07 UTC)",
+        "window_fn":   lambda hours, dow: ((dow == 0) & (hours >= 1) & (hours < 9)),
+        "asian_hours": (1, 9),
+    },
 }
 
-GRID_M2 = {
-    "ldn_move_pct":      [80, 70, 60],
-    "wick_mult":         [2.5, 2.0, 1.5],
-    "tp_multiple":       [3.0, 2.0, 1.5],
-    "stop_buffer_atr":   [0.2, 0.0],
-}
-
-GRID_M3 = {
-    "box_lookback":      [60, 40, 20],
-    "box_atr_ratio":     [1.5, 1.0, 0.7],
-    "expansion_mult":    [1.5, 1.2, 1.0],
-    "tp_mult":           [3.0, 2.0, 1.5],
-}
-
-def _ncombos(g):
-    r = 1
-    for v in g.values(): r *= len(v)
-    return r
-
-assert _ncombos(GRID_GLOBAL) * _ncombos(GRID_M1) <= 20_000
-assert _ncombos(GRID_GLOBAL) * _ncombos(GRID_M2) <= 20_000
-assert _ncombos(GRID_GLOBAL) * _ncombos(GRID_M3) <= 20_000
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PROGRESS BAR
+#  INDICATORS
 # ══════════════════════════════════════════════════════════════════════════════
 
-class Bar:
-    def __init__(self, total, prefix="", w=48):
-        self.total = total; self.w = w
-        self.prefix = prefix; self.cur = 0
-        self.t0 = time.time(); self._show(0)
-
-    def step(self, n=1):
-        self.cur = min(self.cur + n, self.total); self._show(self.cur)
-
-    def _show(self, done):
-        p   = done / self.total if self.total else 1
-        f   = int(self.w * p)
-        el  = time.time() - self.t0
-        eta = (el / p - el) if p > 0.001 else 0
-        sys.stdout.write(
-            f"\r{self.prefix} [{'█'*f}{'░'*(self.w-f)}] "
-            f"{done}/{self.total} {p*100:.0f}%  {el:.0f}s  ETA {eta:.0f}s   "
-        )
-        sys.stdout.flush()
-        if done >= self.total:
-            sys.stdout.write("\n"); sys.stdout.flush()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DATA FETCH  —  identical pattern to proven template
-#  Raw broker timestamps kept as-is; session windows expressed in broker hours.
-# ══════════════════════════════════════════════════════════════════════════════
-
-def fetch(sym, n=FETCH_BARS):
-    rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, n)
-    if rates is None or len(rates) < 2000:
-        logger.warning(f"  {sym}: fetch failed — {mt5.last_error()}")
-        return None
-    df = pd.DataFrame(rates)
-    # Keep timestamps in broker local time (GMT+2) — no conversion needed
-    # because all session masks below use broker hours directly.
-    df["time"] = pd.to_datetime(df["time"], unit="s")
-    df["h_broker"] = df["time"].dt.hour
-    df["m_broker"] = df["time"].dt.minute
-    df["date"]     = df["time"].dt.date
-    # minute-of-day in broker time
-    df["mod"]      = df["h_broker"] * 60 + df["m_broker"]
-    logger.info(
-        f"  {sym}: {len(df):,} bars  "
-        f"{df['time'].iloc[0].date()} → {df['time'].iloc[-1].date()}"
-    )
-    return df.reset_index(drop=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  BASE CACHE — computed once per symbol
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_base_cache(df):
-    o   = df["open"].values.astype(np.float64)
-    h   = df["high"].values.astype(np.float64)
-    l   = df["low"].values.astype(np.float64)
-    c   = df["close"].values.astype(np.float64)
-    mod = df["mod"].values.astype(np.int32)       # broker minute-of-day
-    dt  = df["date"].values
-    n   = len(c)
-
-    # ── ATR-14 (EWM, matches template) ────────────────────────────────────
+def compute_atr(h, l, c, period=14):
     tr = np.maximum(h - l,
          np.maximum(np.abs(h - np.roll(c, 1)),
                     np.abs(l - np.roll(c, 1))))
     tr[0] = h[0] - l[0]
-    atr = pd.Series(tr).ewm(span=14, adjust=False).mean().values
+    return pd.Series(tr).rolling(period).mean().values
 
-    # ── Body / range ───────────────────────────────────────────────────────
-    body      = np.abs(c - o)
-    bar_range = h - l
-    med_body  = pd.Series(body).rolling(100, min_periods=10).median().values
-    med_range = pd.Series(bar_range).rolling(100, min_periods=10).median().values
+def rolling_realized_vol(c, window):
+    lr = np.diff(np.log(np.maximum(c, 1e-9)), prepend=np.log(c[0]))
+    return pd.Series(lr).rolling(window).std().values
 
-    # ── Session masks in BROKER hours (GMT+2, hardcoded) ──────────────────
-    #   Asia    : broker 02:00–08:00  (UTC 00:00–06:00)
-    #   London  : broker 09:00–12:00  (UTC 07:00–10:00)
-    #   NY      : broker 14:30–17:00  (UTC 12:30–15:00)
-    #   Rollover: broker 01:00–03:00 and 23:00–24:00
-    asia_mask   = (mod >= 120)  & (mod < 480)    # broker 02:00–08:00
-    london_mask = (mod >= 540)  & (mod < 720)    # broker 09:00–12:00
-    ny_mask     = (mod >= 870)  & (mod < 1020)   # broker 14:30–17:00
-    rollover    = (mod >= 1380) | (mod < 180)    # broker 23:00–03:00
+def rolling_quantile(arr, window, q):
+    return pd.Series(arr).rolling(window, min_periods=window // 2).quantile(q).values
 
-    # ── Asian range per day (no lookahead) ────────────────────────────────
-    unique_d = np.unique(dt)
-    day_ah, day_al, day_ar = {}, {}, {}
-    for d in unique_d:
-        m = (dt == d) & asia_mask
-        if m.any():
-            day_ah[d] = h[m].max()
-            day_al[d] = l[m].min()
-            day_ar[d] = day_ah[d] - day_al[d]
-
-    a_hi  = np.full(n, np.nan)
-    a_lo  = np.full(n, np.nan)
-    a_rng = np.full(n, np.nan)
-    a_pct = np.full(n, np.nan)
-    sorted_ar = []; seen_ad = set()
-    for i in range(n):
-        if london_mask[i]:
-            d = dt[i]
-            if d in day_ah:
-                a_hi[i]  = day_ah[d]
-                a_lo[i]  = day_al[d]
-                a_rng[i] = day_ar[d]
-                r = day_ar[d]
-                if len(sorted_ar) > 0:
-                    a_pct[i] = bisect.bisect_left(sorted_ar, r) / len(sorted_ar) * 100
-                if d not in seen_ad:
-                    bisect.insort(sorted_ar, r)
-                    seen_ad.add(d)
-
-    # ── London move (open of broker 09:00 bar → close of broker 11:59 bar) ─
-    ldn_o_bar = (mod >= 540) & (mod < 541)   # broker 09:00
-    ldn_c_bar = (mod >= 719) & (mod < 720)   # broker 11:59
-    lo_by_d, lc_by_d = {}, {}
-    for i in range(n):
-        d = dt[i]
-        if ldn_o_bar[i]: lo_by_d[d] = o[i]
-        if ldn_c_bar[i]: lc_by_d[d] = c[i]
-
-    ldn_move = np.full(n, np.nan)
-    ldn_mpct = np.full(n, np.nan)
-    sorted_lm = []; seen_ld = set()
-    for i in range(n):
-        if ny_mask[i]:
-            d = dt[i]
-            if d in lo_by_d and d in lc_by_d:
-                mv = lc_by_d[d] - lo_by_d[d]
-                ldn_move[i] = mv
-                ab = abs(mv)
-                if len(sorted_lm) > 0:
-                    ldn_mpct[i] = bisect.bisect_left(sorted_lm, ab) / len(sorted_lm) * 100
-                if d not in seen_ld:
-                    bisect.insort(sorted_lm, ab)
-                    seen_ld.add(d)
-
-    # ── Log returns (RV computed per rv_window in grid loop) ──────────────
-    log_ret = np.diff(np.log(np.maximum(c, 1e-9)), prepend=np.log(c[0]))
-
-    return {
-        "n": n, "o": o, "h": h, "l": l, "c": c,
-        "atr": atr, "body": body, "bar_range": bar_range,
-        "med_body": med_body, "med_range": med_range,
-        "mod": mod, "dt": dt,
-        "asia_mask": asia_mask, "london_mask": london_mask,
-        "ny_mask": ny_mask, "rollover": rollover,
-        "a_hi": a_hi, "a_lo": a_lo, "a_rng": a_rng, "a_pct": a_pct,
-        "ldn_move": ldn_move, "ldn_mpct": ldn_mpct,
-        "log_ret": log_ret,
-        "times": df["time"].values,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PARAM-DEPENDENT RECOMPUTE
-# ══════════════════════════════════════════════════════════════════════════════
-
-def compute_regimes_and_eff(base, rv_w, eff_w):
-    n  = base["n"]
-    c  = base["c"]
-    lr = base["log_ret"]
-
-    rv_raw = np.sqrt(np.maximum(
-        pd.Series(lr ** 2).rolling(rv_w, min_periods=rv_w // 2).sum().values, 0.0))
-
-    rv_pct    = np.full(n, 50.0)
-    sorted_rv = []
-    warmup    = max(rv_w * 3, 500)
-    for i in range(n):
-        if i >= warmup and len(sorted_rv) > 0:
-            rv_pct[i] = bisect.bisect_left(sorted_rv, rv_raw[i]) / len(sorted_rv) * 100
-        if i % 5 == 0:
-            bisect.insort(sorted_rv, rv_raw[i])
-
-    rl = rv_pct < RV_LOW_PCT
-    rm = (rv_pct >= RV_MED_LO) & (rv_pct <= RV_MED_HI)
-    rh = rv_pct > RV_HIGH_PCT
-
-    shifted = pd.Series(c).shift(eff_w).values
-    net     = np.abs(c - shifted)
-    gross   = pd.Series(
-        np.abs(np.diff(c, prepend=c[0]))
-    ).rolling(eff_w, min_periods=2).sum().values
+def micro_vwap(h, l, c, v, window):
+    tp      = (h + l + c) / 3.0
+    cum_tpv = pd.Series(tp * v).rolling(window).sum().values
+    cum_v   = pd.Series(v.astype(float)).rolling(window).sum().values
     with np.errstate(divide="ignore", invalid="ignore"):
-        eff = np.where(gross > 0, net / gross, 0.0)
-
-    return rl, rm, rh, eff
+        return np.where(cum_v > 0, cum_tpv / cum_v, c)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SIGNAL DETECTORS
+#  CACHE BUILD
 # ══════════════════════════════════════════════════════════════════════════════
 
-def detect_m1(base, regime_med, eff, eff_thr, pm):
-    """London Liquidity Expansion"""
-    c        = base["c"]
-    atr      = base["atr"]
-    body     = base["body"]; med_body = base["med_body"]
-    a_hi     = base["a_hi"]; a_lo = base["a_lo"]
-    a_rng    = base["a_rng"]; a_pct = base["a_pct"]
-    win      = base["london_mask"]
+def build_cache(arrays, times, edge_name):
+    o, h, l, c, v = arrays
+    n     = len(c)
+    cache = {"m1_arrays": arrays, "times_m1": times}
 
-    valid = (win
-             & regime_med
-             & (eff >= eff_thr)
-             & ~np.isnan(a_hi)
-             & ~np.isnan(a_pct)
-             & (a_pct < pm["asia_range_pct"])
-             & (a_rng > 0)
-             & (body >= pm["body_mult"] * med_body))
+    cache["atr14"]   = compute_atr(h, l, c, 14)
+    cache["rvol_30"] = rolling_realized_vol(c, 30)
 
-    long_s  = valid & (c > a_hi)
-    short_s = valid & (c < a_lo)
+    VOL_LB = min(28_800, n // 2)
+    for q in [30, 40, 50, 60, 70]:
+        cache[f"rvol_q{q}"] = rolling_quantile(cache["rvol_30"], VOL_LB, q / 100)
 
-    n    = base["n"]
-    dirs = np.zeros(n, dtype=np.int8)
-    dirs[long_s]  = 1
-    dirs[short_s] = -1
+    bar_range = h - l
+    cache["bar_range"] = bar_range
+    SPR_LB = min(43_200, n // 2)
+    for q in [20, 30, 40, 50]:
+        cache[f"spread_q{q}"] = rolling_quantile(bar_range, SPR_LB, q / 100)
 
-    buf = pm["stop_buffer_atr"]
-    sl  = np.full(n, np.nan)
-    sl[long_s]  = a_lo[long_s]  - buf * atr[long_s]
-    sl[short_s] = a_hi[short_s] + buf * atr[short_s]
+    cache["vol_mean_60"]          = pd.Series(v.astype(float)).rolling(60, min_periods=10).mean().values
+    cache[f"mvwap_{VWAP_WINDOW}"] = micro_vwap(h, l, c, v, VWAP_WINDOW)
 
-    tp_dist = a_rng * pm["tp_mult"]
-    return dirs, sl, ("fixed_dist", tp_dist)
+    dt  = pd.DatetimeIndex(times)
+    hrs = dt.hour
+    dow = dt.dayofweek
 
+    edge_def              = EDGES[edge_name]
+    cache["trade_window"] = edge_def["window_fn"](hrs, dow)
+    cache["dt"]           = dt
+    cache["dates"]        = np.array(dt.date)
+    cache["hours"]        = np.array(hrs)
 
-def detect_m2(base, regime_high, eff, eff_thr, pm):
-    """NY Trend Exhaustion Reversal"""
-    c        = base["c"]; o = base["o"]
-    h        = base["h"]; l = base["l"]
-    atr      = base["atr"]
-    body     = base["body"]
-    ldn_move = base["ldn_move"]
-    ldn_mpct = base["ldn_mpct"]
-    win      = base["ny_mask"]
+    ah_start, ah_end = edge_def["asian_hours"]
+    asian_mask = (hrs >= ah_start) & (hrs < ah_end)
 
-    has_move    = ~np.isnan(ldn_move) & ~np.isnan(ldn_mpct)
-    strong_move = has_move & (ldn_mpct >= pm["ldn_move_pct"])
-    bull_london = strong_move & (ldn_move > 0)
-    bear_london = strong_move & (ldn_move < 0)
+    asian_hi = np.full(n, np.nan)
+    asian_lo = np.full(n, np.nan)
+    dates    = cache["dates"]
+    unique_d = np.unique(dates)
+    date_hi  = {}; date_lo = {}
+    for d in unique_d:
+        m = (dates == d) & asian_mask
+        if m.any():
+            date_hi[d] = h[m].max()
+            date_lo[d] = l[m].min()
+    prev_hi = prev_lo = np.nan
+    cur_d   = None
+    for i in range(n):
+        d = dates[i]
+        if d != cur_d:
+            cur_d = d
+            for delta in range(1, 8):
+                pd_ = d - datetime.timedelta(days=delta)
+                if pd_ in date_hi:
+                    prev_hi = date_hi[pd_]
+                    prev_lo = date_lo[pd_]
+                    break
+        if cache["trade_window"][i]:
+            asian_hi[i] = prev_hi
+            asian_lo[i] = prev_lo
+    cache["asian_hi"] = asian_hi
+    cache["asian_lo"] = asian_lo
 
-    upper_wick = h - np.maximum(o, c)
-    lower_wick = np.minimum(o, c) - l
-    safe_body  = np.maximum(body, 1e-9)
+    body = np.abs(c - o); rng = h - l
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cache["body_ratio"] = np.where(rng > 0, body / rng, 0.0)
+        cache["close_pos"]  = np.where(rng > 0, (c - l) / rng, 0.5)
 
-    bear_rej = bull_london & (c < o) & (upper_wick >= pm["wick_mult"] * safe_body)
-    bull_rej = bear_london & (c > o) & (lower_wick >= pm["wick_mult"] * safe_body)
+    tw_arr     = cache["trade_window"].astype(bool)
+    not_tw_idx = np.where(~tw_arr)[0]
+    all_idx    = np.arange(n)
+    ins        = np.searchsorted(not_tw_idx, all_idx, side="right")
+    ins_clip   = np.minimum(ins, len(not_tw_idx) - 1)
+    next_end   = not_tw_idx[ins_clip]
+    cache["dist_to_sess_end"] = np.where(
+        next_end > all_idx,
+        np.minimum(next_end - all_idx, MAX_HOLD),
+        MAX_HOLD
+    ).astype(np.int32)
 
-    valid_s = win & regime_high & (eff >= eff_thr) & bear_rej
-    valid_l = win & regime_high & (eff >= eff_thr) & bull_rej
-
-    n    = base["n"]
-    dirs = np.zeros(n, dtype=np.int8)
-    dirs[valid_l] = 1
-    dirs[valid_s] = -1
-
-    buf = pm["stop_buffer_atr"]
-    sl  = np.full(n, np.nan)
-    sl[valid_l] = l[valid_l] - buf * atr[valid_l]
-    sl[valid_s] = h[valid_s] + buf * atr[valid_s]
-
-    return dirs, sl, ("sl_mult", pm["tp_multiple"])
-
-
-def detect_m3(base, regime_low, eff, eff_thr, pm):
-    """Volatility Compression Breakout"""
-    c         = base["c"]; h = base["h"]; l = base["l"]
-    atr       = base["atr"]
-    bar_range = base["bar_range"]
-    med_range = base["med_range"]
-    rollover  = base["rollover"]
-
-    lkbk  = pm["box_lookback"]
-    box_h = pd.Series(h).rolling(lkbk, min_periods=lkbk // 2).max().shift(1).values
-    box_l = pd.Series(l).rolling(lkbk, min_periods=lkbk // 2).min().shift(1).values
-    box_r = box_h - box_l
-
-    valid_base = (~rollover
-                  & regime_low
-                  & (eff >= eff_thr)
-                  & ~np.isnan(box_h)
-                  & (box_r > 0)
-                  & (box_r <= pm["box_atr_ratio"] * atr)
-                  & (bar_range >= pm["expansion_mult"] * med_range))
-
-    long_s  = valid_base & (c > box_h)
-    short_s = valid_base & (c < box_l)
-
-    n    = base["n"]
-    dirs = np.zeros(n, dtype=np.int8)
-    dirs[long_s]  = 1
-    dirs[short_s] = -1
-
-    box_mid = (box_h + box_l) / 2.0
-    sl      = np.full(n, np.nan)
-    sl[long_s]  = box_mid[long_s]
-    sl[short_s] = box_mid[short_s]
-
-    return dirs, sl, ("box_mult", box_r, pm["tp_mult"])
+    cache["opp_bull"] = (c < o)
+    cache["opp_bear"] = (c > o)
+    return cache
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  VECTORIZED BACKTEST
+#  SIGNAL DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
-                 regime_low, regime_med, regime_high):
-    n     = base["n"]
-    o     = base["o"]; h = base["h"]; l = base["l"]; c = base["c"]
-    times = base["times"]
+def detect_signals(params, cache):
+    o, h, l, c, v = cache["m1_arrays"]
+    n   = len(c)
+    atr = cache["atr14"]
+    tw  = cache["trade_window"]
 
-    sig_idx = np.where(dirs != 0)[0]
-    sig_idx = sig_idx[sig_idx + 1 < n]
-    if len(sig_idx) == 0:
-        return None, []
+    vq = params["vol_threshold_q"].replace("q", "")
+    sq = params["spread_q"].replace("q", "")
+    regime = (cache["rvol_30"] <= cache[f"rvol_q{vq}"]) & \
+             (cache["bar_range"] <= cache[f"spread_q{sq}"])
 
-    ei = sig_idx + 1          # entry bar — no lookahead
-    d  = dirs[sig_idx]
-    ep = o[ei]                # entry at next bar open, no spread adjustment
+    N    = params["sweep_lookback"]
+    mult = params["sweep_atr_mult"]
+    roll_hi = pd.Series(h).rolling(N, min_periods=N // 2).max().shift(1).values
+    roll_lo = pd.Series(l).rolling(N, min_periods=N // 2).min().shift(1).values
 
-    sl_p    = sl_arr[sig_idx]
-    sl_dist = np.maximum(np.abs(ep - sl_p), 1e-9)
+    bull_gen   = tw & (l < roll_lo - mult * atr) & (c > roll_lo)
+    bear_gen   = tw & (h > roll_hi + mult * atr) & (c < roll_hi)
+    has_range  = ~np.isnan(cache["asian_hi"])
+    bull_asian = tw & has_range & (l < cache["asian_lo"] - mult * atr * 0.5) & (c > cache["asian_lo"])
+    bear_asian = tw & has_range & (h > cache["asian_hi"] + mult * atr * 0.5) & (c < cache["asian_hi"])
+    bull_sw    = bull_gen | bull_asian
+    bear_sw    = bear_gen | bear_asian
 
-    # ── Target price ───────────────────────────────────────────────────────
-    tp_type = tp_info[0]
-    if tp_type == "fixed_dist":
-        tp_d = tp_info[1][sig_idx]
-        tp_p = np.where(d == 1, ep + tp_d, ep - tp_d)
-    elif tp_type == "sl_mult":
-        mult = tp_info[1]
-        tp_p = np.where(d == 1, ep + sl_dist * mult, ep - sl_dist * mult)
-    else:  # "box_mult"
-        br   = tp_info[1][sig_idx]; mult = tp_info[2]
-        tp_p = np.where(d == 1, ep + br * mult, ep - br * mult)
+    body    = np.abs(c - o)
+    vm      = cache["vol_mean_60"]
+    disp_Ab = (c > o) & (body >= params["body_atr_mult"] * atr) & (cache["body_ratio"] >= 0.70)
+    disp_As = (c < o) & (body >= params["body_atr_mult"] * atr) & (cache["body_ratio"] >= 0.70)
+    vol_spk = v >= params["vol_mult"] * vm
+    disp_Bb = vol_spk & (cache["close_pos"] >= 0.80)
+    disp_Bs = vol_spk & (cache["close_pos"] <= 0.20)
+    db      = disp_Ab | disp_Bb
+    dr      = disp_As | disp_Bs
 
-    nt        = len(sig_idx)
-    hold_caps = np.full(nt, MAX_HOLD_BARS, dtype=np.int32)
-    max_cap   = MAX_HOLD_BARS
+    db_next = np.roll(db, -1); db_next[-1] = False
+    dr_next = np.roll(dr, -1); dr_next[-1] = False
 
-    offsets = np.arange(max_cap)
-    abs_i   = np.clip(ei[:, None] + offsets[None, :], 0, n - 1)
+    signal = np.zeros(n, dtype=np.int8)
+    signal = np.where(regime & bull_sw & (db | db_next),  1, signal)
+    signal = np.where(regime & bear_sw & (dr | dr_next), -1, signal)
+    signal[:100] = 0
 
-    fut_h = h[abs_i]; fut_l = l[abs_i]; fut_c = c[abs_i]
+    cache["_sweep_lo"] = roll_lo
+    cache["_sweep_hi"] = roll_hi
+    return signal
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BACKTEST
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_backtest(signal, cache, params, initial_balance=10_000.0):
+    o, h, l, c, v = cache["m1_arrays"]
+    n        = len(signal)
+    atr      = cache["atr14"]
+    rr       = max(float(params["rr_ratio"]), 1.0)
+    buf      = params["buffer_atr"]
+    mvwap    = cache[f"mvwap_{VWAP_WINDOW}"]
+    sweep_lo = cache["_sweep_lo"]
+    sweep_hi = cache["_sweep_hi"]
+    dist_end = cache["dist_to_sess_end"]
+    opp_bull = cache["opp_bull"]
+    opp_bear = cache["opp_bear"]
+    dates    = cache["dates"]
+    dt_hours = cache["dt"].hour
+    times    = cache["times_m1"]
+
+    raw_idx = np.where(signal != 0)[0]
+    raw_idx = raw_idx[raw_idx + 1 < n]
+    if len(raw_idx) == 0:
+        return _empty(), []
+
+    dirs      = signal[raw_idx].astype(np.int8)
+    entry_idx = raw_idx + 1
+    ep        = o[entry_idx]
+
+    has_lo   = ~np.isnan(sweep_lo[raw_idx])
+    has_hi   = ~np.isnan(sweep_hi[raw_idx])
+    sl_long  = np.where(has_lo, sweep_lo[raw_idx] - buf * atr[raw_idx], ep - SL_MULTIPLIER * atr[raw_idx])
+    sl_short = np.where(has_hi, sweep_hi[raw_idx] + buf * atr[raw_idx], ep + SL_MULTIPLIER * atr[raw_idx])
+    sl_price = np.where(dirs == 1, sl_long, sl_short)
+    sl_dist  = np.maximum(np.abs(ep - sl_price), atr[raw_idx] * 0.05)
+    tp_price = np.where(dirs == 1, ep + sl_dist * rr, ep - sl_dist * rr)
+
+    n_raw       = len(raw_idx)
+    valid       = np.zeros(n_raw, dtype=bool)
+    last_exit   = -999
+    sess_counts = {}
+
+    for i in range(n_raw):
+        ei       = int(entry_idx[i])
+        d        = dates[ei]
+        sess_key = (d, "S")
+        if ei - last_exit < COOLDOWN_BARS:
+            continue
+        if sess_counts.get(sess_key, 0) >= MAX_TRADES_PER_SESSION:
+            continue
+        valid[i] = True
+        sess_counts[sess_key] = sess_counts.get(sess_key, 0) + 1
+        last_exit = ei + min(MAX_HOLD, int(dist_end[ei]))
+
+    vi = np.where(valid)[0]
+    if len(vi) == 0:
+        return _empty(), []
+
+    n_trades  = len(vi)
+    v_entry   = entry_idx[vi]
+    v_dirs    = dirs[vi]
+    v_ep      = ep[vi]
+    v_sl      = sl_price[vi]
+    v_tp      = tp_price[vi]
+    v_sl_dist = sl_dist[vi]
+    hold_caps = np.minimum(dist_end[v_entry], MAX_HOLD).astype(np.int32)
+    max_cap   = int(hold_caps.max())
+
+    offsets  = np.arange(max_cap)
+    abs_idx  = np.clip(v_entry[:, None] + offsets[None, :], 0, n - 1)
+    fut_l    = l[abs_idx]; fut_h = h[abs_idx]; fut_c = c[abs_idx]
+    vwap_2d  = mvwap[abs_idx]
     off_mask = offsets[None, :] < hold_caps[:, None]
 
-    # SL: long hit when price low touches sl; short when high touches sl
-    sl_hit = np.where(d[:, None] == 1,
-                      fut_l <= sl_p[:, None],
-                      fut_h >= sl_p[:, None]) & off_mask
-    # TP: long hit when high reaches tp; short when low reaches tp
-    tp_hit = np.where(d[:, None] == 1,
-                      fut_h >= tp_p[:, None],
-                      fut_l <= tp_p[:, None]) & off_mask
+    sl_p    = v_sl[:, None]; tp_p = v_tp[:, None]
+    sl_hit  = np.where(v_dirs[:, None] == 1, fut_l <= sl_p, fut_h >= sl_p) & off_mask
+    tp_hit  = np.where(v_dirs[:, None] == 1, fut_h >= tp_p, fut_l <= tp_p) & off_mask
 
-    any_exit = sl_hit | tp_hit
+    prev_c_2d = np.roll(fut_c, 1, axis=1); prev_c_2d[:, 0] = v_ep
+    prev_vwap = np.roll(vwap_2d, 1, axis=1); prev_vwap[:, 0] = vwap_2d[:, 0]
+    vwap_xl   = (fut_c < vwap_2d) & (prev_c_2d >= prev_vwap)
+    vwap_xs   = (fut_c > vwap_2d) & (prev_c_2d <= prev_vwap)
+    vwap_x    = np.where(v_dirs[:, None] == 1, vwap_xl, vwap_xs) & off_mask
+
+    adv = np.where(v_dirs[:, None] == 1, opp_bull[abs_idx], opp_bear[abs_idx]) & off_mask
+    cum = np.cumsum(adv.astype(np.int8), axis=1)
+    c3  = np.zeros_like(cum)
+    c3[:, 3:] = cum[:, 3:] - cum[:, :-3]
+    c3[:, :3] = cum[:, :3]
+    consec3  = (c3 >= 3) & off_mask
+    early    = (vwap_x | consec3) & (offsets[None, :] >= 3) & off_mask
+    any_exit = sl_hit | tp_hit | early
     first    = np.argmax(any_exit, axis=1)
-    hit      = any_exit[np.arange(nt), first]
+    hit      = any_exit[np.arange(n_trades), first]
     exit_off = np.where(hit, first, hold_caps - 1)
 
-    at_sl  = sl_hit[np.arange(nt), exit_off]
-    at_tp  = tp_hit[np.arange(nt), exit_off]
-    exit_c = fut_c[np.arange(nt), exit_off]
+    at_sl    = sl_hit[np.arange(n_trades), exit_off]
+    at_tp    = tp_hit[np.arange(n_trades), exit_off]
+    exit_c   = fut_c[np.arange(n_trades), exit_off]
+    er       = np.clip((exit_c - v_ep) / v_sl_dist * np.where(v_dirs == 1, 1, -1), -2.0, rr)
+    outcome_r = np.where(at_sl, -1.0, np.where(at_tp, rr, er))
+    valid_t   = ~np.isnan(outcome_r)
+    outcome_r = outcome_r[valid_t]
+    v_entry_f = v_entry[valid_t]
 
-    raw_r    = np.clip((exit_c - ep) / sl_dist * d, -2.0, 4.0)
-    tp_rr    = np.abs(tp_p - ep) / sl_dist
-    result_r = np.where(at_sl, -1.0, np.where(at_tp, tp_rr, raw_r))
+    if len(outcome_r) == 0:
+        return _empty(), []
 
-    reg = np.where(regime_low[sig_idx],  "low",
-          np.where(regime_med[sig_idx],  "med",
-          np.where(regime_high[sig_idx], "high", "neutral")))
+    trade_log = [
+        {"bar": int(v_entry_f[k]), "time": pd.Timestamp(times[int(v_entry_f[k])]), "r": float(outcome_r[k])}
+        for k in range(len(outcome_r))
+    ]
 
-    trades = []
-    for k in range(nt):
-        trades.append({
-            "timestamp":         str(times[ei[k]]),
-            "model_id":          model_id,
-            "direction":         "long" if d[k] == 1 else "short",
-            "entry_price":       round(float(ep[k]),    6),
-            "stop_price":        round(float(sl_p[k]),  6),
-            "target_price":      round(float(tp_p[k]),  6),
-            "volatility_regime": str(reg[k]),
-            "result_r":          round(float(result_r[k]), 4),
-        })
+    wins_mask = outcome_r > 0
+    wins      = int(wins_mask.sum())
+    losses    = int((~wins_mask).sum())
+    tt        = wins + losses
+    win_r     = float(outcome_r[wins_mask].sum())
+    loss_r    = float(np.abs(outcome_r[~wins_mask]).sum())
+    wr        = wins / tt
+    awr       = win_r / wins    if wins   else 0.0
+    alr       = loss_r / losses if losses else 1.0
+    exp_r     = wr * awr - (1 - wr) * alr
+    pf        = win_r / loss_r  if loss_r > 0 else float("inf")
 
-    if len(trades) < MIN_TRADES:
-        return None, trades
+    balance = initial_balance
+    bal_arr = [balance]
+    for r_ in outcome_r:
+        balance = balance * (1 + RISK_PER_TRADE * r_) if r_ > 0 \
+                  else balance * (1 - RISK_PER_TRADE * abs(r_))
+        bal_arr.append(balance)
+    bal_arr = np.array(bal_arr)
+    rm  = np.maximum.accumulate(bal_arr)
+    dd  = rm - bal_arr
+    mdd = float(dd.max() / rm[np.argmax(dd)]) if len(bal_arr) > 1 else 0.0
 
-    rr   = result_r
-    wins = rr > 0
-    tt   = len(rr)
-    wr   = wins.sum() / tt
-    wr_  = float(rr[wins].sum())
-    lr_  = float(np.abs(rr[~wins].sum())) if (~wins).sum() > 0 else 1.0
-    nw   = wins.sum(); nl = (~wins).sum()
-    exp  = wr * (wr_ / nw if nw else 0) - (1 - wr) * (lr_ / nl if nl else 1)
-    pf   = wr_ / lr_ if lr_ > 0 else 999.0
-
-    bal  = 10_000.0; bals = [bal]
-    for r in rr:
-        bal = bal * (1 + RISK_PER_TRADE * r) if r > 0 \
-              else bal * (1 - RISK_PER_TRADE * abs(r))
-        bals.append(bal)
-    bals = np.array(bals)
-    rm_  = np.maximum.accumulate(bals)
-    dd   = rm_ - bals
-    mdd  = float(dd.max() / rm_[np.argmax(dd)]) if len(bals) > 1 else 0.0
-
-    t0  = pd.Timestamp(times[0]); t1 = pd.Timestamp(times[-1])
-    wks = max((t1 - t0).total_seconds() / 604_800, 1.0)
+    signs  = np.where(wins_mask, 1, -1)
+    trans  = np.diff(signs, prepend=signs[0] + 1)
+    sts    = np.where(trans != 0)[0]
+    slen   = np.diff(np.append(sts, len(signs)))
+    ssig   = signs[sts]
+    max_ls = int(slen[ssig == -1].max()) if (ssig == -1).any() else 0
 
     return {
         "total_trades":     tt,
-        "win_rate":         round(wr,  4),
-        "expectancy_r":     round(exp, 4),
-        "profit_factor":    round(pf,  3),
-        "max_drawdown":     round(mdd, 4),
-        "trades_per_week":  round(tt / wks, 2),
-    }, trades
+        "wins":             wins,
+        "win_rate":         wr,
+        "expectancy_r":     float(exp_r),
+        "profit_factor":    float(pf),
+        "max_drawdown_pct": mdd,
+        "max_loss_streak":  max_ls,
+        "return_pct":       float((balance - initial_balance) / initial_balance),
+    }, trade_log
+
+
+def _empty():
+    return {"total_trades": 0, "wins": 0, "win_rate": 0.0, "expectancy_r": 0.0,
+            "profit_factor": 0.0, "max_drawdown_pct": 0.0, "max_loss_streak": 0, "return_pct": 0.0}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GRID RUNNER
+#  CORRELATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_model_grid(model_id, detect_fn, grid_m, base_caches):
-    keys_g   = list(GRID_GLOBAL.keys())
-    keys_m   = list(grid_m.keys())
-    combos_g = list(itertools.product(*[GRID_GLOBAL[k] for k in keys_g]))
-    combos_m = list(itertools.product(*[grid_m[k]      for k in keys_m]))
-    total    = len(combos_g) * len(combos_m)
+def compute_correlation_matrix(pair_logs, pairs):
+    series_dict = {}
+    for sym in pairs:
+        if sym in pair_logs and pair_logs[sym]:
+            df  = pd.DataFrame(pair_logs[sym])
+            df["hour"] = df["time"].dt.floor("h")
+            s   = df.groupby("hour")["r"].sum()
+            if len(s) > 10:
+                series_dict[sym] = s
+    if len(series_dict) < 2:
+        return None
+    return pd.DataFrame(series_dict).fillna(0).corr()
 
-    all_rows   = []
-    all_trades = []
 
-    for sym, base in base_caches.items():
-        pb = Bar(total, prefix=f"  M{model_id} {sym}")
+def print_correlation_report(corr, edge_name):
+    if corr is None or corr.empty:
+        logger.info(f"\n[{edge_name}] Correlation matrix: insufficient data")
+        return
+    syms = list(corr.columns)
+    n    = len(syms)
+    logger.info(f"\n*** R-MULTIPLE CORRELATION MATRIX — {edge_name} ***")
+    header = f"{'':>8}" + "".join(f"  {s:>8}" for s in syms)
+    logger.info(header)
+    for s1 in syms:
+        row = f"{s1:>8}"
+        for s2 in syms:
+            val = corr.loc[s1, s2]
+            row += f"  {'1.000':>8}" if s1 == s2 else f"  {val:>+7.3f} "
+        logger.info(row)
 
-        for g_vals in combos_g:
-            pg   = dict(zip(keys_g, g_vals))
-            rv_w = pg["rv_window"]
-            ew   = pg["efficiency_window"]
-            ethr = pg["efficiency_threshold"]
+    pairs_corr = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            pairs_corr.append((syms[i], syms[j], corr.loc[syms[i], syms[j]]))
 
-            rl, rm, rh, eff = compute_regimes_and_eff(base, rv_w, ew)
+    logger.info(f"\n*** MOST UNCORRELATED PAIRS — {edge_name} ***")
+    for s1, s2, c in sorted(pairs_corr, key=lambda x: abs(x[2]))[:8]:
+        logger.info(f"  {s1:>8} / {s2:<8}  corr={c:+.3f}")
 
-            for m_vals in combos_m:
-                pm = dict(zip(keys_m, m_vals))
-
-                try:
-                    regime_for_model = (rm if model_id == 1
-                                        else rh if model_id == 2
-                                        else rl)
-                    dirs, sl_arr, tp_info = detect_fn(
-                        base, regime_for_model, eff, ethr, pm)
-                    stats, trades = backtest_vec(
-                        base, dirs, sl_arr, tp_info,
-                        model_id, rl, rm, rh)
-                except Exception as e:
-                    stats = None; trades = []
-
-                if stats is not None:
-                    row = {**pg, **pm, "symbol": sym, **stats}
-                    all_rows.append(row)
-                    for t in trades:
-                        t["symbol"] = sym
-                    all_trades.extend(trades)
-
-                pb.step()
-
-    return all_rows, all_trades
+    logger.info(f"\n*** MOST CORRELATED PAIRS — {edge_name} ***")
+    for s1, s2, c in sorted(pairs_corr, key=lambda x: abs(x[2]), reverse=True)[:5]:
+        logger.info(f"  {s1:>8} / {s2:<8}  corr={c:+.3f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SUMMARY PRINTER
+#  RESULTS TABLE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def print_top(agg, model_id, keys_m, top=10):
-    sep = "─" * 92
-    logger.info(f"\n{'='*60}")
-    logger.info(f"MODEL {model_id} — TOP {top}  (mean expectancy across all symbols)")
+def print_results_table(results, edge_name):
+    passed = [(s, r) for s, r in results.items() if r["total_trades"] >= MIN_TRADES]
+    failed = [(s, r) for s, r in results.items() if r["total_trades"] < MIN_TRADES]
+    passed.sort(key=lambda x: x[1]["expectancy_r"], reverse=True)
+
+    sep = "─" * 85
+    logger.info(f"\n{'='*85}")
+    logger.info(f"RESULTS — {edge_name} — {EDGES[edge_name]['description']}")
+    logger.info(f"Sorted by Expectancy | Passed: {len(passed)}/{len(results)} pairs")
     logger.info(sep)
-    for i, row in agg.head(top).iterrows():
-        ps = "  ".join(f"{k}={row[k]}" for k in (list(GRID_GLOBAL.keys()) + keys_m))
+    logger.info(f"{'PAIR':>8}  {'n':>5}  {'WR':>6}  {'E':>7}  {'PF':>6}  {'MDD':>6}  {'LSTR':>5}  {'RET':>8}")
+    logger.info(sep)
+
+    for sym, r in passed:
         logger.info(
-            f"  #{i+1:<3} WR={row['win_rate']:.1%}  E={row['expectancy_r']:+.3f}  "
-            f"PF={row['profit_factor']:.2f}  MDD={row['max_drawdown']:.1%}  "
-            f"T/wk={row['trades_per_week']:.1f}"
+            f"{sym:>8}  {r['total_trades']:>5}  {r['win_rate']:>5.1%}  "
+            f"{r['expectancy_r']:>+6.3f}  {r['profit_factor']:>6.2f}  "
+            f"{r['max_drawdown_pct']:>5.1%}  {r['max_loss_streak']:>5}  "
+            f"{r['return_pct']:>+7.0%}"
         )
-        logger.info(f"       {ps}")
-    if len(agg):
-        best = agg.iloc[0]
-        logger.info(f"\n  ★ BEST COMBO MODEL {model_id}")
-        for k in list(GRID_GLOBAL.keys()) + keys_m:
-            logger.info(f"    {k:<28}: {best[k]}")
-        logger.info(f"    {'win_rate':<28}: {best['win_rate']:.1%}")
-        logger.info(f"    {'expectancy_r':<28}: {best['expectancy_r']:+.4f}R")
-        logger.info(f"    {'profit_factor':<28}: {best['profit_factor']:.3f}")
-        logger.info(f"    {'max_drawdown':<28}: {best['max_drawdown']:.2%}")
-        logger.info(f"    {'trades_per_week':<28}: {best['trades_per_week']:.1f}")
+
+    if failed:
+        logger.info(sep)
+        logger.info(f"INSUFFICIENT TRADES (< {MIN_TRADES}):")
+        for sym, r in failed:
+            logger.info(f"  {sym}: {r['total_trades']} trades")
     logger.info(sep)
+
+    # Portfolio summary
+    total_n   = sum(r["total_trades"] for _, r in passed)
+    avg_wr    = np.mean([r["win_rate"] for _, r in passed]) if passed else 0
+    avg_exp   = np.mean([r["expectancy_r"] for _, r in passed]) if passed else 0
+    pairs_70  = sum(1 for _, r in passed if r["win_rate"] >= 0.70)
+    pairs_exp = sum(1 for _, r in passed if r["expectancy_r"] >= 0.8)
+
+    logger.info(f"\n*** PORTFOLIO SUMMARY — {edge_name} ***")
+    logger.info(f"  Pairs passing min trades : {len(passed)}/{len(results)}")
+    logger.info(f"  Pairs with WR >= 70%     : {pairs_70}/{len(passed)}")
+    logger.info(f"  Pairs with E >= 0.8      : {pairs_exp}/{len(passed)}")
+    logger.info(f"  Average WR               : {avg_wr:.1%}")
+    logger.info(f"  Average Expectancy       : {avg_exp:+.3f}")
+    logger.info(f"  Total trades (portfolio) : {total_n}")
+    logger.info(f"  Trades per year (est)    : {total_n / 6.5:.0f}")
+    logger.info(f"  Trades per week (est)    : {total_n / (6.5 * 52):.1f}")
+
+    # Overfit verdict
+    if pairs_70 >= 8 and avg_exp >= 0.8:
+        logger.info(f"\n  ✓ OVERFIT DEFENSE PASSED — {pairs_70} pairs with WR≥70%, avg E={avg_exp:+.3f}")
+        logger.info(f"    Same fixed params generalise across uncorrelated assets. Not curve fitted.")
+    elif pairs_70 >= 5:
+        logger.info(f"\n  ~ PARTIAL — {pairs_70} pairs pass WR≥70%. Moderate generalization.")
+    else:
+        logger.info(f"\n  ✗ WEAK GENERALIZATION — edge may be pair-specific")
+
+    return passed
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATA FETCH
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_pair(symbol, n=FETCH_BARS):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, n)
+    if rates is None or len(rates) < 200:
+        logger.warning(f"  {symbol}: fetch failed — {mt5.last_error()}")
+        return None
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    logger.info(f"  {symbol}: {len(df):,} bars | {df['time'].iloc[0].date()} -> {df['time'].iloc[-1].date()}")
+    return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
+def run_scan():
     if not MT5_AVAILABLE:
-        raise RuntimeError("MetaTrader5 package not found.")
-    if not mt5.initialize(path=TERMINAL_PATH, login=LOGIN,
-                          password=PASSWORD, server=SERVER):
+        raise RuntimeError("MetaTrader5 not installed.")
+    if not mt5.initialize(path=TERMINAL_PATH, login=LOGIN, password=PASSWORD, server=SERVER):
         raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
 
-    logger.info("=" * 70)
-    logger.info("MULTI-MODEL FX ENGINE — VECTORIZED GRID SEARCH")
-    logger.info(f"M1 combos: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M1):,}  "
-                f"M2: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M2):,}  "
-                f"M3: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M3):,}  (all ≤20K)")
-    logger.info("Broker time: GMT+2 fixed — session masks in broker hours")
-    logger.info("  Asia    : broker 02:00–08:00  (UTC 00:00–06:00)")
-    logger.info("  London  : broker 09:00–12:00  (UTC 07:00–10:00)")
-    logger.info("  NY      : broker 14:30–17:00  (UTC 12:30–15:00)")
-    logger.info("No lookahead: signal bar i → entry open[i+1]")
-    logger.info("No spread adjustment — raw open price used for entry")
-    logger.info("=" * 70)
+    logger.info("=" * 85)
+    logger.info("MULTI-PAIR EDGE VALIDATION — Fix Window + Monday Asia")
+    logger.info(f"Pairs: {len(PAIRS)} | Bars: {FETCH_BARS:,} | Fixed params per edge")
+    logger.info("=" * 85)
 
-    # ── Fetch & cache ──────────────────────────────────────────────────────
-    base_caches = {}
-    for sym in SYMBOLS:
-        logger.info(f"\n[{sym}] fetching...")
-        df = fetch(sym)
-        if df is not None:
-            logger.info(f"[{sym}] building cache...")
-            base_caches[sym] = build_base_cache(df)
+    for edge_name, edge_def in EDGES.items():
+        logger.info(f"\n{'='*85}")
+        logger.info(f"EDGE: {edge_name} — {edge_def['description']}")
+        logger.info(f"Params: {EDGE_PARAMS[edge_name]}")
+        logger.info(f"{'='*85}")
+
+        results   = {}
+        pair_logs = {}
+
+        for sym in PAIRS:
+            logger.info(f"\n[{sym}] fetching...")
+            df = fetch_pair(sym)
+            if df is None:
+                results[sym]   = _empty()
+                pair_logs[sym] = []
+                continue
+
+            arrays = (df["open"].values, df["high"].values,
+                      df["low"].values,  df["close"].values,
+                      df["tick_volume"].values)
+
+            logger.info(f"[{sym}] building cache + running backtest...")
+            cache  = build_cache(arrays, df["time"].values, edge_name)
+            signal = detect_signals(EDGE_PARAMS[edge_name], cache)
+            stats, trade_log = run_backtest(signal, cache, EDGE_PARAMS[edge_name])
+
+            results[sym]   = stats
+            pair_logs[sym] = trade_log
+
+            logger.info(
+                f"[{sym}] n={stats['total_trades']} WR={stats['win_rate']:.1%} "
+                f"E={stats['expectancy_r']:+.3f} MDD={stats['max_drawdown_pct']:.1%} "
+                f"lstr={stats['max_loss_streak']}"
+            )
+
+        # Results table + portfolio summary
+        passed = print_results_table(results, edge_name)
+
+        # Correlation matrix
+        active = [s for s in PAIRS if pair_logs.get(s) and len(pair_logs[s]) >= MIN_TRADES]
+        corr   = compute_correlation_matrix(pair_logs, active)
+        print_correlation_report(corr, edge_name)
 
     mt5.shutdown()
-    if not base_caches:
-        logger.error("No data fetched. Aborting."); return
-
-    # ── Model loop ─────────────────────────────────────────────────────────
-    model_defs = [
-        (1, detect_m1, GRID_M1, list(GRID_M1.keys())),
-        (2, detect_m2, GRID_M2, list(GRID_M2.keys())),
-        (3, detect_m3, GRID_M3, list(GRID_M3.keys())),
-    ]
-
-    for model_id, detect_fn, grid_m, keys_m in model_defs:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"RUNNING MODEL {model_id} — {len(base_caches)} symbols")
-        rows, trades = run_model_grid(model_id, detect_fn, grid_m, base_caches)
-
-        if not rows:
-            logger.warning(f"  Model {model_id}: zero valid combos — "
-                           f"consider loosening thresholds")
-            continue
-
-        df_full = pd.DataFrame(rows)
-        df_full.to_csv(f"mme_m{model_id}_grid.csv", index=False)
-
-        if trades:
-            pd.DataFrame(trades).to_csv(
-                f"mme_m{model_id}_trades.csv", index=False)
-            logger.info(f"  {len(trades):,} trades → mme_m{model_id}_trades.csv")
-
-        agg_keys = list(GRID_GLOBAL.keys()) + keys_m
-        agg = df_full.groupby(agg_keys).agg(
-            symbols_valid   = ("symbol",          "count"),
-            win_rate        = ("win_rate",         "mean"),
-            expectancy_r    = ("expectancy_r",     "mean"),
-            profit_factor   = ("profit_factor",    "mean"),
-            max_drawdown    = ("max_drawdown",     "mean"),
-            trades_per_week = ("trades_per_week",  "mean"),
-        ).reset_index()
-
-        agg = agg[agg["symbols_valid"] == len(base_caches)]
-        agg = agg.sort_values("expectancy_r", ascending=False).reset_index(drop=True)
-        agg.to_csv(f"mme_m{model_id}_agg.csv", index=False)
-        logger.info(f"  Grid agg → mme_m{model_id}_agg.csv  "
-                    f"({len(agg)} valid combos across all symbols)")
-
-        print_top(agg, model_id, keys_m)
-
-    logger.info(f"\n{'='*70}")
-    logger.info("COMPLETE. Best params per model in mme_m1/m2/m3_agg.csv")
-    logger.info("=" * 70)
+    logger.info("\n" + "=" * 85)
+    logger.info("Scan complete — full results in edge_multi_pair.log")
+    logger.info("=" * 85)
 
 
 if __name__ == "__main__":
-    main()
+    run_scan()
