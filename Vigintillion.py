@@ -144,6 +144,13 @@ class Bar:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch(sym, n=FETCH_BARS):
+
+    if not mt5.symbol_select(sym, True):
+        logger.warning(f"  {sym}: symbol_select failed — {mt5.last_error()}")
+        return None
+
+    logger.info(f"  requesting {sym} M1 bars...")
+
     rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, n)
     if rates is None or len(rates) < 2000:
         logger.warning(f"  {sym}: fetch failed — {mt5.last_error()}")
