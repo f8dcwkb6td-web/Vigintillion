@@ -47,8 +47,8 @@ _sh.setFormatter(logging.Formatter("%(message)s"))
 logger.addHandler(_sh)
 
 # ── MT5 connection ─────────────────────────────────────────────────────────────
-TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH",r"C:\Program Files\MetaTrader 5\terminal64.exe")
-                               
+TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH",
+                               r"C:\Program Files\MetaTrader 5\terminal64.exe")
 LOGIN    = 7376407
 PASSWORD = "iC8XoiRp&4L4KU"
 SERVER   = "ICMarketsSC-MT5-2"
@@ -680,7 +680,7 @@ def print_top(agg, model_id, keys_m, top=10):
 def main():
     if not MT5_AVAILABLE:
         raise RuntimeError("MetaTrader5 package not found.")
-    if not mt5.initialize(path=TERMINAL_PATH, login=LOGIN,
+    if not mt5.initialize(login=LOGIN,
                           password=PASSWORD, server=SERVER):
         raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
 
