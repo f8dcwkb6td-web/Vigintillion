@@ -672,44 +672,54 @@ def print_top(agg, model_id, keys_m, top=10):
     logger.info(sep)
 
 # ═══════════════════════════════════════════════════════════════════════
+# MT5 CONNECTION
+# ═══════════════════════════════════════════════════════════════════════
+
+def connect_mt5():
+
+    if not MT5_AVAILABLE:
+        raise RuntimeError("MetaTrader5 package not installed")
+
+    logger.info("Starting MetaTrader 5 terminal...")
+
+    # IMPORTANT: pass terminal path as positional argument
+    if not mt5.initialize(TERMINAL_PATH):
+        err = mt5.last_error()
+        raise RuntimeError(f"MT5 initialize failed: {err}")
+
+    logger.info("Terminal initialized")
+
+    # Login separately
+    if not mt5.login(LOGIN, PASSWORD, SERVER):
+        err = mt5.last_error()
+        mt5.shutdown()
+        raise RuntimeError(f"MT5 login failed: {err}")
+
+    logger.info(f"MT5 connected | Account {LOGIN} | Server {SERVER}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
 
-    if not MT5_AVAILABLE:
-        raise RuntimeError("MetaTrader5 package not found.")
+    # Connect to MT5
+    connect_mt5()
 
-    # ── START TERMINAL ─────────────────────────────────────────────────
-    if not mt5.initialize(path=TERMINAL_PATH):
-        error = mt5.last_error()
-        raise RuntimeError(f"MT5 initialize failed: {error}")
-
-    # ── LOGIN ACCOUNT ──────────────────────────────────────────────────
-    authorized = mt5.login(LOGIN, password=PASSWORD, server=SERVER)
-
-    if not authorized:
-        error = mt5.last_error()
-        mt5.shutdown()
-        raise RuntimeError(f"MT5 login failed: {error}")
-
-    logger.info(f"MT5 connected | Account {LOGIN} | Server {SERVER}")
-
-    # ── ENGINE HEADER ──────────────────────────────────────────────────
     logger.info("=" * 70)
     logger.info("MULTI-MODEL FX ENGINE — VECTORIZED GRID SEARCH")
     logger.info(
         f"M1 combos: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M1):,}  "
         f"M2: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M2):,}  "
-        f"M3: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M3):,}  (all ≤20K)"
+        f"M3: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M3):,}"
     )
     logger.info("No lookahead: signal bar i → entry open[i+1]")
-    logger.info("Spread-aware: long=open+sp/2  short=open-sp/2")
     logger.info("=" * 70)
 
-    # ── FETCH DATA ─────────────────────────────────────────────────────
     base_caches = {}
 
+    # ── Fetch data ─────────────────────────────────────────
     for sym in SYMBOLS:
 
         logger.info(f"\n[{sym}] fetching...")
@@ -722,25 +732,25 @@ def main():
         logger.info(f"[{sym}] building cache...")
         base_caches[sym] = build_base_cache(df)
 
-    # Done with MT5
+    # Close MT5 after data fetch
     mt5.shutdown()
 
     if not base_caches:
         logger.error("No data fetched. Aborting.")
         return
 
-    # ── MODEL DEFINITIONS ──────────────────────────────────────────────
+    # ── Model definitions ──────────────────────────────────
     model_defs = [
         (1, detect_m1, GRID_M1, list(GRID_M1.keys())),
         (2, detect_m2, GRID_M2, list(GRID_M2.keys())),
         (3, detect_m3, GRID_M3, list(GRID_M3.keys())),
     ]
 
-    # ── RUN MODELS ─────────────────────────────────────────────────────
+    # ── Run models ─────────────────────────────────────────
     for model_id, detect_fn, grid_m, keys_m in model_defs:
 
         logger.info(f"\n{'='*60}")
-        logger.info(f"RUNNING MODEL {model_id} — {len(base_caches)} symbols")
+        logger.info(f"RUNNING MODEL {model_id}")
 
         rows, trades = run_model_grid(
             model_id,
@@ -750,10 +760,7 @@ def main():
         )
 
         if not rows:
-            logger.warning(
-                f"Model {model_id}: zero valid combos — "
-                f"consider loosening thresholds"
-            )
+            logger.warning("No valid parameter combinations")
             continue
 
         df_full = pd.DataFrame(rows)
@@ -763,10 +770,6 @@ def main():
             pd.DataFrame(trades).to_csv(
                 f"mme_m{model_id}_trades.csv",
                 index=False
-            )
-
-            logger.info(
-                f"{len(trades):,} trades → mme_m{model_id}_trades.csv"
             )
 
         agg_keys = list(GRID_GLOBAL.keys()) + keys_m
@@ -789,15 +792,10 @@ def main():
 
         agg.to_csv(f"mme_m{model_id}_agg.csv", index=False)
 
-        logger.info(
-            f"Grid agg → mme_m{model_id}_agg.csv "
-            f"({len(agg)} valid combos across all symbols)"
-        )
-
         print_top(agg, model_id, keys_m)
 
     logger.info("\n" + "=" * 70)
-    logger.info("COMPLETE. Best params per model in mme_m1/m2/m3_agg.csv")
+    logger.info("COMPLETE")
     logger.info("=" * 70)
 
 
