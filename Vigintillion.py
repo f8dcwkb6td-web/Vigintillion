@@ -52,14 +52,12 @@ LOGIN          = int(os.environ.get("MT5_LOGIN",    7376407))
 PASSWORD       = os.environ.get("MT5_PASSWORD", "iC8XoiRp&4L4KU")
 SERVER         = os.environ.get("MT5_SERVER",   "ICMarketsSC-MT5-2")
 
-FETCH_BARS     = 200_000      # reduced from 500k — stays within broker history limits
+FETCH_BARS     = 200_000
 SYMBOLS        = ["AUDJPY", "EURJPY", "EURAUD", "GBPJPY", "USDJPY"]
 MIN_TRADES     = 50
 RISK_PER_TRADE = 0.06
 MAX_HOLD_BARS  = 120
 FIXED_SPREAD   = 0.0002
-FETCH_RETRIES  = 5
-FETCH_DELAY    = 2.0          # seconds between retries
 
 RV_LOW_PCT  = 40
 RV_MED_LO   = 40
@@ -161,83 +159,101 @@ def connect_mt5():
     info = mt5.account_info()
     if info is None:
         mt5.shutdown()
-        raise RuntimeError(f"account_info returned None after init: {mt5.last_error()}")
+        raise RuntimeError(f"account_info returned None: {mt5.last_error()}")
 
     logger.info(f"MT5 connected | Account {info.login} | Server {info.server} | Balance {info.balance}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DATA FETCH  — robust retry, correct symbol resolution, broker-time → UTC
+#  SYMBOL DIAGNOSTIC — run before any fetch so failures are fully visible
+#  Pattern copied directly from Centillion's run_live() startup block
 # ══════════════════════════════════════════════════════════════════════════════
 
-def resolve_symbol(base_name):
-    """
-    IC Markets often appends suffixes like 'm', '.r', '.pro', etc.
-    Try the bare name first, then search for the best match.
-    """
-    # Try exact name first
-    info = mt5.symbol_info(base_name)
-    if info is not None:
-        return base_name
+def run_symbol_diagnostic():
+    logger.info("=== SYMBOL DIAGNOSTIC ===")
+    for sym in SYMBOLS:
+        info = mt5.symbol_info(sym)
+        if info is None:
+            all_syms   = mt5.symbols_get()
+            candidates = (
+                [s.name for s in all_syms if sym[:3] in s.name or sym[3:] in s.name]
+                if all_syms else []
+            )
+            logger.warning(
+                f"  {sym}: symbol_info=None — NOT FOUND. "
+                f"Possible names: {candidates[:10]}"
+            )
+        else:
+            tick       = mt5.symbol_info_tick(sym)
+            rates_test = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, 5)
+            logger.info(
+                f"  {sym}: visible={info.visible}  trade_mode={info.trade_mode}  "
+                f"spread={info.spread}  digits={info.digits}  "
+                f"tick={'OK' if tick else 'None'}  "
+                f"bars_test={'OK len='+str(len(rates_test)) if rates_test is not None else 'None — '+str(mt5.last_error())}  "
+                f"path={info.path}"
+            )
+    logger.info("=== END DIAGNOSTIC ===")
 
-    # Search for any symbol containing the base name
-    all_syms = mt5.symbols_get()
-    if all_syms is None:
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATA FETCH
+#  Mirrors Centillion's fetch_bars exactly:
+#    - raw copy_rates_from_pos, no symbol_select, no sleep, no retry loop
+#    - full diagnostic dump on None so the error is always visible in the log
+#    - drop forming bar with iloc[:-1]
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch(sym, n=FETCH_BARS):
+    rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, n)
+
+    if rates is None:
+        err  = mt5.last_error()
+        info = mt5.symbol_info(sym)
+        if info is None:
+            all_syms   = mt5.symbols_get()
+            candidates = (
+                [s.name for s in all_syms if sym[:3] in s.name or sym[3:] in s.name]
+                if all_syms else []
+            )
+            logger.warning(
+                f"[{sym}] fetch returned None — "
+                f"error=({err[0]}, '{err[1]}') | "
+                f"symbol_info=None (symbol unknown to terminal) | "
+                f"possible names: {candidates[:10]}"
+            )
+        else:
+            tick       = mt5.symbol_info_tick(sym)
+            rates_test = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, 5)
+            logger.warning(
+                f"[{sym}] fetch returned None — "
+                f"error=({err[0]}, '{err[1]}') | "
+                f"visible={info.visible}  trade_mode={info.trade_mode}  "
+                f"spread={info.spread}  digits={info.digits}  "
+                f"tick={'OK' if tick else 'None'}  "
+                f"bars_test={'OK len='+str(len(rates_test)) if rates_test is not None else 'None — '+str(mt5.last_error())}  "
+                f"path={info.path}"
+            )
         return None
 
-    candidates = [s.name for s in all_syms if base_name in s.name]
-    if not candidates:
-        return None
-
-    # Prefer shortest match (closest to the bare name)
-    candidates.sort(key=len)
-    logger.info(f"  {base_name}: resolved to '{candidates[0]}' (candidates: {candidates[:5]})")
-    return candidates[0]
-
-
-def fetch(base_sym, n=FETCH_BARS):
-    # Resolve broker-specific symbol name
-    sym = resolve_symbol(base_sym)
-    if sym is None:
-        logger.warning(f"  {base_sym}: no matching symbol found on broker")
-        return None
-
-    # Select and warm up the symbol feed
-    if not mt5.symbol_select(sym, True):
-        logger.warning(f"  {sym}: symbol_select failed — {mt5.last_error()}")
-        return None
-
-    # Give the terminal time to subscribe and populate history
-    time.sleep(1.0)
-
-    rates = None
-    for attempt in range(1, FETCH_RETRIES + 1):
-        rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, n)
-        if rates is not None and len(rates) >= 2000:
-            break
-        err = mt5.last_error()
-        logger.warning(f"  {sym}: attempt {attempt}/{FETCH_RETRIES} failed — {err}")
-        if attempt < FETCH_RETRIES:
-            time.sleep(FETCH_DELAY)
-
-    if rates is None or len(rates) < 2000:
-        logger.warning(f"  {sym}: all fetch attempts failed")
+    if len(rates) < 2000:
+        logger.warning(f"[{sym}] only {len(rates)} bars returned — skipping")
         return None
 
     df = pd.DataFrame(rates)
 
-    # ── Broker time → UTC ─────────────────────────────────────────────────────
-    # IC Markets uses EET/EEST (Europe/Athens): UTC+2 winter, UTC+3 summer.
-    # MT5 timestamps are Unix seconds but represent broker wall-clock time.
-    raw_ts = pd.to_datetime(df["time"], unit="s")
+    
+    # ── Broker time → UTC ─────────────────────────────────────────────────
+    # IC Markets: EET/EEST (Europe/Athens) — UTC+2 winter, UTC+3 summer
+    df["time"] = pd.to_datetime(df["time"], unit="s")
     try:
-        broker_aware = raw_ts.dt.tz_localize(
+        broker_aware = df["time"].dt.tz_localize(
             "Europe/Athens", ambiguous="infer", nonexistent="shift_forward"
         )
         utc_ts = broker_aware.dt.tz_convert("UTC").dt.tz_localize(None)
     except Exception:
-        logger.warning(f"  {sym}: DST conversion failed — using fixed UTC-2 offset")
-        utc_ts = raw_ts - pd.Timedelta(hours=2)
+        logger.warning(f"[{sym}] DST conversion failed — falling back to fixed UTC-2")
+        utc_ts = df["time"] - pd.Timedelta(hours=2)
 
     df["time"]       = utc_ts
     df["h_utc"]      = df["time"].dt.hour
@@ -245,16 +261,15 @@ def fetch(base_sym, n=FETCH_BARS):
     df["date"]       = df["time"].dt.date
     df["min_of_day"] = df["h_utc"] * 60 + df["m_utc"]
 
-    # Spread in price terms
     if "spread" in df.columns:
         info  = mt5.symbol_info(sym)
-        point = info.point if info and info.point > 0 else 0.0001
+        point = info.point if (info and info.point > 0) else 0.0001
         df["spread_price"] = df["spread"].astype(float) * point
     else:
         df["spread_price"] = np.nan
 
     logger.info(
-        f"  {sym}: {len(df):,} bars  "
+        f"  [{sym}] {len(df):,} bars  "
         f"{df['time'].iloc[0].date()} → {df['time'].iloc[-1].date()}  "
         f"spread={'col' if 'spread' in df.columns else 'fixed'}"
     )
@@ -293,7 +308,7 @@ def build_base_cache(df):
     ny_mask     = (mod >= 750)  & (mod < 900)    # 12:30–15:00
     rollover    = (mod >= 1380) | (mod < 60)     # 23:00–01:00
 
-    # ── Asian range per day (built forward, no lookahead)
+    # ── Asian range per day (no lookahead)
     unique_d = np.unique(dt)
     day_ah, day_al, day_ar = {}, {}, {}
     for d in unique_d:
@@ -734,22 +749,25 @@ def main():
     logger.info("No lookahead: signal bar i → entry open[i+1]")
     logger.info("=" * 70)
 
-    # ── Fetch all data before shutting MT5 down ────────────────────────────
+    # ── Diagnostic first — see exactly what the broker exposes ────────────
+    run_symbol_diagnostic()
+
+    # ── Fetch all data then close MT5 ─────────────────────────────────────
     base_caches = {}
-    for base_sym in SYMBOLS:
-        logger.info(f"\n[{base_sym}] fetching...")
-        df = fetch(base_sym)
+    for sym in SYMBOLS:
+        logger.info(f"\n[{sym}] fetching {FETCH_BARS:,} bars...")
+        df = fetch(sym)
         if df is None:
-            logger.warning(f"[{base_sym}] skipped — no data")
+            logger.warning(f"[{sym}] skipped — see diagnostic output above")
             continue
-        logger.info(f"[{base_sym}] building cache...")
-        base_caches[base_sym] = build_base_cache(df)
+        logger.info(f"[{sym}] building cache...")
+        base_caches[sym] = build_base_cache(df)
 
     mt5.shutdown()
     logger.info("\nMT5 connection closed")
 
     if not base_caches:
-        logger.error("No data fetched — aborting")
+        logger.error("No data fetched — aborting. Check diagnostic output in log.")
         return
 
     # ── Run models ─────────────────────────────────────────────────────────
