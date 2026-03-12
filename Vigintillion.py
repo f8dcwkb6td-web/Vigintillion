@@ -671,27 +671,31 @@ def print_top(agg, model_id, keys_m, top=10):
         logger.info(f"    {'trades_per_week':<28}: {best['trades_per_week']:.1f}")
     logger.info(sep)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════
 
 def main():
+
     if not MT5_AVAILABLE:
         raise RuntimeError("MetaTrader5 package not found.")
 
-    # ── Initialize MT5 terminal ─────────────────────────────
+    # ── START TERMINAL ─────────────────────────────────────────────────
     if not mt5.initialize(path=TERMINAL_PATH):
-        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+        error = mt5.last_error()
+        raise RuntimeError(f"MT5 initialize failed: {error}")
 
-    # ── Login to account ────────────────────────────────────
-    if not mt5.login(LOGIN, password=PASSWORD, server=SERVER):
-        err = mt5.last_error()
+    # ── LOGIN ACCOUNT ──────────────────────────────────────────────────
+    authorized = mt5.login(LOGIN, password=PASSWORD, server=SERVER)
+
+    if not authorized:
+        error = mt5.last_error()
         mt5.shutdown()
-        raise RuntimeError(f"MT5 login failed: {err}")
+        raise RuntimeError(f"MT5 login failed: {error}")
 
     logger.info(f"MT5 connected | Account {LOGIN} | Server {SERVER}")
 
+    # ── ENGINE HEADER ──────────────────────────────────────────────────
     logger.info("=" * 70)
     logger.info("MULTI-MODEL FX ENGINE — VECTORIZED GRID SEARCH")
     logger.info(
@@ -703,41 +707,52 @@ def main():
     logger.info("Spread-aware: long=open+sp/2  short=open-sp/2")
     logger.info("=" * 70)
 
-    # ── Fetch data ──────────────────────────────────────────
+    # ── FETCH DATA ─────────────────────────────────────────────────────
     base_caches = {}
 
     for sym in SYMBOLS:
+
         logger.info(f"\n[{sym}] fetching...")
+
         df = fetch(sym)
 
-        if df is not None:
-            logger.info(f"[{sym}] building cache...")
-            base_caches[sym] = build_base_cache(df)
+        if df is None:
+            continue
 
+        logger.info(f"[{sym}] building cache...")
+        base_caches[sym] = build_base_cache(df)
+
+    # Done with MT5
     mt5.shutdown()
 
     if not base_caches:
         logger.error("No data fetched. Aborting.")
         return
 
-    # ── Model definitions ───────────────────────────────────
+    # ── MODEL DEFINITIONS ──────────────────────────────────────────────
     model_defs = [
         (1, detect_m1, GRID_M1, list(GRID_M1.keys())),
         (2, detect_m2, GRID_M2, list(GRID_M2.keys())),
         (3, detect_m3, GRID_M3, list(GRID_M3.keys())),
     ]
 
-    # ── Run models ──────────────────────────────────────────
+    # ── RUN MODELS ─────────────────────────────────────────────────────
     for model_id, detect_fn, grid_m, keys_m in model_defs:
 
         logger.info(f"\n{'='*60}")
         logger.info(f"RUNNING MODEL {model_id} — {len(base_caches)} symbols")
 
-        rows, trades = run_model_grid(model_id, detect_fn, grid_m, base_caches)
+        rows, trades = run_model_grid(
+            model_id,
+            detect_fn,
+            grid_m,
+            base_caches
+        )
 
         if not rows:
             logger.warning(
-                f"Model {model_id}: zero valid combos — consider loosening thresholds"
+                f"Model {model_id}: zero valid combos — "
+                f"consider loosening thresholds"
             )
             continue
 
@@ -746,19 +761,23 @@ def main():
 
         if trades:
             pd.DataFrame(trades).to_csv(
-                f"mme_m{model_id}_trades.csv", index=False
+                f"mme_m{model_id}_trades.csv",
+                index=False
             )
-            logger.info(f"{len(trades):,} trades → mme_m{model_id}_trades.csv")
+
+            logger.info(
+                f"{len(trades):,} trades → mme_m{model_id}_trades.csv"
+            )
 
         agg_keys = list(GRID_GLOBAL.keys()) + keys_m
 
         agg = df_full.groupby(agg_keys).agg(
-            symbols_valid   = ("symbol", "count"),
-            win_rate        = ("win_rate", "mean"),
-            expectancy_r    = ("expectancy_r", "mean"),
-            profit_factor   = ("profit_factor", "mean"),
-            max_drawdown    = ("max_drawdown", "mean"),
-            trades_per_week = ("trades_per_week", "mean"),
+            symbols_valid=("symbol", "count"),
+            win_rate=("win_rate", "mean"),
+            expectancy_r=("expectancy_r", "mean"),
+            profit_factor=("profit_factor", "mean"),
+            max_drawdown=("max_drawdown", "mean"),
+            trades_per_week=("trades_per_week", "mean"),
         ).reset_index()
 
         agg = agg[agg["symbols_valid"] == len(base_caches)]
@@ -777,9 +796,10 @@ def main():
 
         print_top(agg, model_id, keys_m)
 
-    logger.info(f"\n{'='*70}")
+    logger.info("\n" + "=" * 70)
     logger.info("COMPLETE. Best params per model in mme_m1/m2/m3_agg.csv")
     logger.info("=" * 70)
+
 
 if __name__ == "__main__":
     main()
