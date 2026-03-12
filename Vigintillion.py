@@ -199,35 +199,38 @@ def run_symbol_diagnostic():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch(sym, n=FETCH_BARS):
-    rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, n)
+
+    rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, int(n) + 1)
 
     if rates is None:
         err  = mt5.last_error()
         info = mt5.symbol_info(sym)
+
         if info is None:
-            all_syms   = mt5.symbols_get()
+            all_syms = mt5.symbols_get()
             candidates = (
                 [s.name for s in all_syms if sym[:3] in s.name or sym[3:] in s.name]
                 if all_syms else []
             )
             logger.warning(
-                f"[{sym}] fetch returned None — "
+                f"[{sym}] fetch failed — "
                 f"error=({err[0]}, '{err[1]}') | "
-                f"symbol_info=None (symbol unknown to terminal) | "
+                f"symbol_info=None | "
                 f"possible names: {candidates[:10]}"
             )
         else:
-            tick       = mt5.symbol_info_tick(sym)
-            rates_test = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, 5)
+            tick = mt5.symbol_info_tick(sym)
             logger.warning(
-                f"[{sym}] fetch returned None — "
+                f"[{sym}] fetch failed — "
                 f"error=({err[0]}, '{err[1]}') | "
-                f"visible={info.visible}  trade_mode={info.trade_mode}  "
-                f"spread={info.spread}  digits={info.digits}  "
-                f"tick={'OK' if tick else 'None'}  "
-                f"bars_test={'OK len='+str(len(rates_test)) if rates_test is not None else 'None — '+str(mt5.last_error())}  "
+                f"visible={info.visible} "
+                f"trade_mode={info.trade_mode} "
+                f"spread={info.spread} "
+                f"digits={info.digits} "
+                f"tick={'OK' if tick else 'None'} "
                 f"path={info.path}"
             )
+
         return None
 
     if len(rates) < 2000:
@@ -236,39 +239,43 @@ def fetch(sym, n=FETCH_BARS):
 
     df = pd.DataFrame(rates)
 
-    
-    # ── Broker time → UTC ─────────────────────────────────────────────────
-    # IC Markets: EET/EEST (Europe/Athens) — UTC+2 winter, UTC+3 summer
+    # remove current forming bar
+    df = df.iloc[:-1]
+
+    # ── Broker time → UTC
     df["time"] = pd.to_datetime(df["time"], unit="s")
+
     try:
         broker_aware = df["time"].dt.tz_localize(
-            "Europe/Athens", ambiguous="infer", nonexistent="shift_forward"
+            "Europe/Athens",
+            ambiguous="infer",
+            nonexistent="shift_forward"
         )
         utc_ts = broker_aware.dt.tz_convert("UTC").dt.tz_localize(None)
     except Exception:
-        logger.warning(f"[{sym}] DST conversion failed — falling back to fixed UTC-2")
+        logger.warning(f"[{sym}] DST conversion failed — fallback UTC-2")
         utc_ts = df["time"] - pd.Timedelta(hours=2)
 
-    df["time"]       = utc_ts
-    df["h_utc"]      = df["time"].dt.hour
-    df["m_utc"]      = df["time"].dt.minute
-    df["date"]       = df["time"].dt.date
+    df["time"] = utc_ts
+    df["h_utc"] = df["time"].dt.hour
+    df["m_utc"] = df["time"].dt.minute
+    df["date"] = df["time"].dt.date
     df["min_of_day"] = df["h_utc"] * 60 + df["m_utc"]
 
     if "spread" in df.columns:
-        info  = mt5.symbol_info(sym)
+        info = mt5.symbol_info(sym)
         point = info.point if (info and info.point > 0) else 0.0001
         df["spread_price"] = df["spread"].astype(float) * point
     else:
         df["spread_price"] = np.nan
 
     logger.info(
-        f"  [{sym}] {len(df):,} bars  "
-        f"{df['time'].iloc[0].date()} → {df['time'].iloc[-1].date()}  "
+        f"  [{sym}] {len(df):,} bars "
+        f"{df['time'].iloc[0].date()} → {df['time'].iloc[-1].date()} "
         f"spread={'col' if 'spread' in df.columns else 'fixed'}"
     )
-    return df.reset_index(drop=True)
 
+    return df.reset_index(drop=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BASE CACHE — computed once per symbol, no grid params
