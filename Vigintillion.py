@@ -680,6 +680,7 @@ def print_top(agg, model_id, keys_m, top=10):
 def main():
     if not MT5_AVAILABLE:
         raise RuntimeError("MetaTrader5 package not found.")
+    mt5.shutdown()
     if not mt5.initialize(login=LOGIN,
                           password=PASSWORD, server=SERVER):
         raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
