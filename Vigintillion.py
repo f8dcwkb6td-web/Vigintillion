@@ -679,13 +679,17 @@ def print_top(agg, model_id, keys_m, top=10):
 def main():
     if not MT5_AVAILABLE:
         raise RuntimeError("MetaTrader5 package not found.")
-    if not mt5.initialize(
-            path=TERMINAL_PATH,
-            login=LOGIN,
-            password=PASSWORD,
-            server=SERVER
-    ):
-        raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+   # Start MT5 terminal
+if not mt5.initialize(path=TERMINAL_PATH):
+    raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+
+# Login to account
+if not mt5.login(int(LOGIN), password=PASSWORD, server=SERVER):
+    err = mt5.last_error()
+    mt5.shutdown()
+    raise RuntimeError(f"MT5 login failed: {err}")
+
+logger.info(f"MT5 connected | Account {LOGIN} | Server {SERVER}")
 
     logger.info("=" * 70)
     logger.info("MULTI-MODEL FX ENGINE — VECTORIZED GRID SEARCH")
