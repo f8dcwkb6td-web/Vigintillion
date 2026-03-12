@@ -49,9 +49,9 @@ logger.addHandler(_sh)
 # ── MT5 connection ─────────────────────────────────────────────────────────────
 TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH",
                                r"C:\Program Files\MetaTrader 5\terminal64.exe")
-LOGIN    = int(os.environ.get("MT5_LOGIN",    0))
-PASSWORD =     os.environ.get("MT5_PASSWORD", "")
-SERVER   =     os.environ.get("MT5_SERVER",   "")
+LOGIN    = 7376407
+PASSWORD = "iC8XoiRp&4L4KU"
+SERVER   = "ICMarketsSC-MT5-2"
 
 FETCH_BARS     = 500_000
 SYMBOLS        = ["AUDJPY", "EURJPY", "EURAUD", "GBPJPY", "USDJPY"]
