@@ -9,21 +9,23 @@ Model 3 : Volatility Compression Breakout   (low vol regime,    excl rollover)
 Rules
   - Signal detected at close of bar i using ONLY data[0..i]
   - Entry price  = open[i+1]  (no lookahead)
-  - Spread-aware: long  entry = open[i+1] + spread[i+1]/2
-                  short entry = open[i+1] - spread[i+1]/2
-  - SL/TP triggers: long uses bid, short uses ask
-  - Session windows use UTC timestamps
+  - SL/TP triggers: long uses low/high, short uses high/low — intra-bar wick
+  - Session windows hardcoded in BROKER hours (IC Markets GMT+2 fixed offset)
+      Asia    : broker 02:00–08:00  →  UTC 00:00–06:00
+      London  : broker 09:00–12:00  →  UTC 07:00–10:00
+      New York: broker 14:30–17:00  →  UTC 12:30–15:00
+      Rollover: broker 01:00–03:00  →  UTC 23:00–01:00
   - Grid <= 20,000 combos per model
 
 Outputs
-  mme_m{1,2,3}_trades.csv
-  mme_m{1,2,3}_grid.csv
-  mme_m{1,2,3}_agg.csv
-  multi_model_engine.log
+  mme_m{1,2,3}_trades.csv  — every trade with all required fields
+  mme_m{1,2,3}_grid.csv    — full grid results per symbol
+  mme_m{1,2,3}_agg.csv     — aggregated results across all symbols
+  multi_model_engine.log   — full run log
 ==============================================================================
 """
 
-import os, sys, io, logging, itertools, time, bisect
+import os, sys, io, logging, itertools, time, bisect, datetime
 import numpy as np
 import pandas as pd
 from logging.handlers import RotatingFileHandler
@@ -47,18 +49,31 @@ _sh.setFormatter(logging.Formatter("%(message)s"))
 logger.addHandler(_sh)
 
 # ── MT5 connection ─────────────────────────────────────────────────────────────
-TERMINAL_PATH  = os.environ.get("MT5_TERMINAL_PATH", r"C:\Program Files\MetaTrader 5\terminal64.exe")
-LOGIN          = int(os.environ.get("MT5_LOGIN",    7376407))
-PASSWORD       = os.environ.get("MT5_PASSWORD", "iC8XoiRp&4L4KU")
-SERVER         = os.environ.get("MT5_SERVER",   "ICMarketsSC-MT5-2")
+TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH",
+                               r"C:\Program Files\MetaTrader 5\terminal64.exe")
+LOGIN    = int(os.environ.get("MT5_LOGIN",    0))
+PASSWORD =     os.environ.get("MT5_PASSWORD", "")
+SERVER   =     os.environ.get("MT5_SERVER",   "")
 
-FETCH_BARS     = 200_000
+# ── Constants ──────────────────────────────────────────────────────────────────
+FETCH_BARS     = 500_000
 SYMBOLS        = ["AUDJPY", "EURJPY", "EURAUD", "GBPJPY", "USDJPY"]
 MIN_TRADES     = 50
 RISK_PER_TRADE = 0.06
-MAX_HOLD_BARS  = 120
-FIXED_SPREAD   = 0.0002
+MAX_HOLD_BARS  = 120      # 2-hour hard cap
 
+# IC Markets broker is GMT+2 (fixed — no DST adjustment needed, we hardcode windows)
+# All session masks are expressed in BROKER hours so the raw MT5 timestamps work
+# directly without any timezone conversion.
+#
+#  Broker hour → UTC:  subtract 2
+#
+#  Asia    broker 02–08  (UTC 00–06)
+#  London  broker 09–12  (UTC 07–10)
+#  NY      broker 14:30–17  (UTC 12:30–15)
+#  Rollover broker 01–03 / 23–24 (UTC 23–01)
+
+# Vol regime percentile thresholds
 RV_LOW_PCT  = 40
 RV_MED_LO   = 40
 RV_MED_HI   = 60
@@ -120,9 +135,9 @@ class Bar:
         self.cur = min(self.cur + n, self.total); self._show(self.cur)
 
     def _show(self, done):
-        p  = done / self.total if self.total else 1
-        f  = int(self.w * p)
-        el = time.time() - self.t0
+        p   = done / self.total if self.total else 1
+        f   = int(self.w * p)
+        el  = time.time() - self.t0
         eta = (el / p - el) if p > 0.001 else 0
         sys.stdout.write(
             f"\r{self.prefix} [{'█'*f}{'░'*(self.w-f)}] "
@@ -134,87 +149,33 @@ class Bar:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MT5 CONNECTION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def connect_mt5():
-
-    if not MT5_AVAILABLE:
-        raise RuntimeError("MetaTrader5 package not installed")
-
-    logger.info("Initializing MT5 terminal...")
-
-    ok = mt5.initialize(path=TERMINAL_PATH)
-
-    if not ok:
-        err = mt5.last_error()
-        raise RuntimeError(f"mt5.initialize failed: {err}")
-
-    info = mt5.account_info()
-
-    if info is None:
-        raise RuntimeError(f"account_info returned None: {mt5.last_error()}")
-
-    logger.info(
-        f"MT5 connected | Account {info.login} | Server {info.server} | Balance {info.balance}"
-    )
-# ══════════════════════════════════════════════════════════════════════════════
-#  SYMBOL DIAGNOSTIC — run before any fetch so failures are fully visible
-#  Pattern copied directly from Centillion's run_live() startup block
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_symbol_diagnostic():
-    logger.info("=== SYMBOL DIAGNOSTIC ===")
-    for sym in SYMBOLS:
-        info = mt5.symbol_info(sym)
-        if info is None:
-            all_syms   = mt5.symbols_get()
-            candidates = (
-                [s.name for s in all_syms if sym[:3] in s.name or sym[3:] in s.name]
-                if all_syms else []
-            )
-            logger.warning(
-                f"  {sym}: symbol_info=None — NOT FOUND. "
-                f"Possible names: {candidates[:10]}"
-            )
-        else:
-            tick       = mt5.symbol_info_tick(sym)
-            rates_test = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, 5)
-            logger.info(
-                f"  {sym}: visible={info.visible}  trade_mode={info.trade_mode}  "
-                f"spread={info.spread}  digits={info.digits}  "
-                f"tick={'OK' if tick else 'None'}  "
-                f"bars_test={'OK len='+str(len(rates_test)) if rates_test is not None else 'None — '+str(mt5.last_error())}  "
-                f"path={info.path}"
-            )
-    logger.info("=== END DIAGNOSTIC ===")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DATA FETCH
-#  Mirrors Centillion's fetch_bars exactly:
-#    - raw copy_rates_from_pos, no symbol_select, no sleep, no retry loop
-#    - full diagnostic dump on None so the error is always visible in the log
-#    - drop forming bar with iloc[:-1]
+#  DATA FETCH  —  identical pattern to proven template
+#  Raw broker timestamps kept as-is; session windows expressed in broker hours.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch(sym, n=FETCH_BARS):
-    rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, int(n) + 1)
-    if rates is None or len(rates) < 10:
-        logger.warning(f"[{sym}] fetch failed or too few bars — last error: {mt5.last_error()}")
+    rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, n)
+    if rates is None or len(rates) < 2000:
+        logger.warning(f"  {sym}: fetch failed — {mt5.last_error()}")
         return None
     df = pd.DataFrame(rates)
-    df = df.iloc[:-1]  # drop forming bar
-    df["time"] = pd.to_datetime(df["time"], unit="s")  # keep broker time
-    df["h_utc"] = df["time"].dt.hour
-    df["m_utc"] = df["time"].dt.minute
-    df["date"] = df["time"].dt.date
-    df["min_of_day"] = df["h_utc"] * 60 + df["m_utc"]
-    df["spread_price"] = 0.0  # remove spread entirely
+    # Keep timestamps in broker local time (GMT+2) — no conversion needed
+    # because all session masks below use broker hours directly.
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df["h_broker"] = df["time"].dt.hour
+    df["m_broker"] = df["time"].dt.minute
+    df["date"]     = df["time"].dt.date
+    # minute-of-day in broker time
+    df["mod"]      = df["h_broker"] * 60 + df["m_broker"]
+    logger.info(
+        f"  {sym}: {len(df):,} bars  "
+        f"{df['time'].iloc[0].date()} → {df['time'].iloc[-1].date()}"
+    )
     return df.reset_index(drop=True)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  BASE CACHE — computed once per symbol, no grid params
+#  BASE CACHE — computed once per symbol
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_base_cache(df):
@@ -222,30 +183,34 @@ def build_base_cache(df):
     h   = df["high"].values.astype(np.float64)
     l   = df["low"].values.astype(np.float64)
     c   = df["close"].values.astype(np.float64)
-    sp  = df["spread_price"].values.astype(np.float64)
-    mod = df["min_of_day"].values.astype(np.int32)
+    mod = df["mod"].values.astype(np.int32)       # broker minute-of-day
     dt  = df["date"].values
     n   = len(c)
 
-    # ATR-14 (EWM)
-    tr    = np.maximum(h - l,
-            np.maximum(np.abs(h - np.roll(c, 1)),
-                       np.abs(l - np.roll(c, 1))))
+    # ── ATR-14 (EWM, matches template) ────────────────────────────────────
+    tr = np.maximum(h - l,
+         np.maximum(np.abs(h - np.roll(c, 1)),
+                    np.abs(l - np.roll(c, 1))))
     tr[0] = h[0] - l[0]
-    atr   = pd.Series(tr).ewm(span=14, adjust=False).mean().values
+    atr = pd.Series(tr).ewm(span=14, adjust=False).mean().values
 
+    # ── Body / range ───────────────────────────────────────────────────────
     body      = np.abs(c - o)
     bar_range = h - l
     med_body  = pd.Series(body).rolling(100, min_periods=10).median().values
     med_range = pd.Series(bar_range).rolling(100, min_periods=10).median().values
 
-    # Session masks (UTC minute-of-day)
-    asia_mask   = (mod >= 0)    & (mod < 360)    # 00:00–06:00
-    london_mask = (mod >= 420)  & (mod < 600)    # 07:00–10:00
-    ny_mask     = (mod >= 750)  & (mod < 900)    # 12:30–15:00
-    rollover    = (mod >= 1380) | (mod < 60)     # 23:00–01:00
+    # ── Session masks in BROKER hours (GMT+2, hardcoded) ──────────────────
+    #   Asia    : broker 02:00–08:00  (UTC 00:00–06:00)
+    #   London  : broker 09:00–12:00  (UTC 07:00–10:00)
+    #   NY      : broker 14:30–17:00  (UTC 12:30–15:00)
+    #   Rollover: broker 01:00–03:00 and 23:00–24:00
+    asia_mask   = (mod >= 120)  & (mod < 480)    # broker 02:00–08:00
+    london_mask = (mod >= 540)  & (mod < 720)    # broker 09:00–12:00
+    ny_mask     = (mod >= 870)  & (mod < 1020)   # broker 14:30–17:00
+    rollover    = (mod >= 1380) | (mod < 180)    # broker 23:00–03:00
 
-    # ── Asian range per day (no lookahead)
+    # ── Asian range per day (no lookahead) ────────────────────────────────
     unique_d = np.unique(dt)
     day_ah, day_al, day_ar = {}, {}, {}
     for d in unique_d:
@@ -268,15 +233,15 @@ def build_base_cache(df):
                 a_lo[i]  = day_al[d]
                 a_rng[i] = day_ar[d]
                 r = day_ar[d]
-                if sorted_ar:
+                if len(sorted_ar) > 0:
                     a_pct[i] = bisect.bisect_left(sorted_ar, r) / len(sorted_ar) * 100
                 if d not in seen_ad:
                     bisect.insort(sorted_ar, r)
                     seen_ad.add(d)
 
-    # ── London move per day
-    ldn_o_bar = (mod >= 420) & (mod < 421)
-    ldn_c_bar = (mod >= 719) & (mod < 720)
+    # ── London move (open of broker 09:00 bar → close of broker 11:59 bar) ─
+    ldn_o_bar = (mod >= 540) & (mod < 541)   # broker 09:00
+    ldn_c_bar = (mod >= 719) & (mod < 720)   # broker 11:59
     lo_by_d, lc_by_d = {}, {}
     for i in range(n):
         d = dt[i]
@@ -293,16 +258,17 @@ def build_base_cache(df):
                 mv = lc_by_d[d] - lo_by_d[d]
                 ldn_move[i] = mv
                 ab = abs(mv)
-                if sorted_lm:
+                if len(sorted_lm) > 0:
                     ldn_mpct[i] = bisect.bisect_left(sorted_lm, ab) / len(sorted_lm) * 100
                 if d not in seen_ld:
                     bisect.insort(sorted_lm, ab)
                     seen_ld.add(d)
 
+    # ── Log returns (RV computed per rv_window in grid loop) ──────────────
     log_ret = np.diff(np.log(np.maximum(c, 1e-9)), prepend=np.log(c[0]))
 
     return {
-        "n": n, "o": o, "h": h, "l": l, "c": c, "sp": sp,
+        "n": n, "o": o, "h": h, "l": l, "c": c,
         "atr": atr, "body": body, "bar_range": bar_range,
         "med_body": med_body, "med_range": med_range,
         "mod": mod, "dt": dt,
@@ -331,7 +297,7 @@ def compute_regimes_and_eff(base, rv_w, eff_w):
     sorted_rv = []
     warmup    = max(rv_w * 3, 500)
     for i in range(n):
-        if i >= warmup and sorted_rv:
+        if i >= warmup and len(sorted_rv) > 0:
             rv_pct[i] = bisect.bisect_left(sorted_rv, rv_raw[i]) / len(sorted_rv) * 100
         if i % 5 == 0:
             bisect.insort(sorted_rv, rv_raw[i])
@@ -357,7 +323,7 @@ def compute_regimes_and_eff(base, rv_w, eff_w):
 
 def detect_m1(base, regime_med, eff, eff_thr, pm):
     """London Liquidity Expansion"""
-    c        = base["c"]; o = base["o"]
+    c        = base["c"]
     atr      = base["atr"]
     body     = base["body"]; med_body = base["med_body"]
     a_hi     = base["a_hi"]; a_lo = base["a_lo"]
@@ -378,7 +344,7 @@ def detect_m1(base, regime_med, eff, eff_thr, pm):
 
     n    = base["n"]
     dirs = np.zeros(n, dtype=np.int8)
-    dirs[long_s]  =  1
+    dirs[long_s]  = 1
     dirs[short_s] = -1
 
     buf = pm["stop_buffer_atr"]
@@ -392,7 +358,8 @@ def detect_m1(base, regime_med, eff, eff_thr, pm):
 
 def detect_m2(base, regime_high, eff, eff_thr, pm):
     """NY Trend Exhaustion Reversal"""
-    c = base["c"]; o = base["o"]; h = base["h"]; l = base["l"]
+    c        = base["c"]; o = base["o"]
+    h        = base["h"]; l = base["l"]
     atr      = base["atr"]
     body     = base["body"]
     ldn_move = base["ldn_move"]
@@ -408,15 +375,15 @@ def detect_m2(base, regime_high, eff, eff_thr, pm):
     lower_wick = np.minimum(o, c) - l
     safe_body  = np.maximum(body, 1e-9)
 
-    bear_rej = (bull_london & (c < o) & (upper_wick >= pm["wick_mult"] * safe_body))
-    bull_rej = (bear_london & (c > o) & (lower_wick >= pm["wick_mult"] * safe_body))
+    bear_rej = bull_london & (c < o) & (upper_wick >= pm["wick_mult"] * safe_body)
+    bull_rej = bear_london & (c > o) & (lower_wick >= pm["wick_mult"] * safe_body)
 
     valid_s = win & regime_high & (eff >= eff_thr) & bear_rej
     valid_l = win & regime_high & (eff >= eff_thr) & bull_rej
 
     n    = base["n"]
     dirs = np.zeros(n, dtype=np.int8)
-    dirs[valid_l] =  1
+    dirs[valid_l] = 1
     dirs[valid_s] = -1
 
     buf = pm["stop_buffer_atr"]
@@ -429,7 +396,7 @@ def detect_m2(base, regime_high, eff, eff_thr, pm):
 
 def detect_m3(base, regime_low, eff, eff_thr, pm):
     """Volatility Compression Breakout"""
-    c = base["c"]; h = base["h"]; l = base["l"]
+    c         = base["c"]; h = base["h"]; l = base["l"]
     atr       = base["atr"]
     bar_range = base["bar_range"]
     med_range = base["med_range"]
@@ -453,7 +420,7 @@ def detect_m3(base, regime_low, eff, eff_thr, pm):
 
     n    = base["n"]
     dirs = np.zeros(n, dtype=np.int8)
-    dirs[long_s]  =  1
+    dirs[long_s]  = 1
     dirs[short_s] = -1
 
     box_mid = (box_h + box_l) / 2.0
@@ -468,7 +435,6 @@ def detect_m3(base, regime_low, eff, eff_thr, pm):
 #  VECTORIZED BACKTEST
 # ══════════════════════════════════════════════════════════════════════════════
 
-
 def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
                  regime_low, regime_med, regime_high):
     n     = base["n"]
@@ -480,14 +446,14 @@ def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
     if len(sig_idx) == 0:
         return None, []
 
-    ei  = sig_idx + 1
-    d   = dirs[sig_idx]
+    ei = sig_idx + 1          # entry bar — no lookahead
+    d  = dirs[sig_idx]
+    ep = o[ei]                # entry at next bar open, no spread adjustment
 
-    ep = o[ei]  # simply entry at next open, no spread
-
-    sl_p = sl_arr[sig_idx]
+    sl_p    = sl_arr[sig_idx]
     sl_dist = np.maximum(np.abs(ep - sl_p), 1e-9)
 
+    # ── Target price ───────────────────────────────────────────────────────
     tp_type = tp_info[0]
     if tp_type == "fixed_dist":
         tp_d = tp_info[1][sig_idx]
@@ -499,19 +465,22 @@ def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
         br   = tp_info[1][sig_idx]; mult = tp_info[2]
         tp_p = np.where(d == 1, ep + br * mult, ep - br * mult)
 
-    # rest of logic unchanged, remove all sp_fwd references
-    nt      = len(sig_idx)
-    max_cap = MAX_HOLD_BARS
+    nt        = len(sig_idx)
+    hold_caps = np.full(nt, MAX_HOLD_BARS, dtype=np.int32)
+    max_cap   = MAX_HOLD_BARS
+
     offsets = np.arange(max_cap)
     abs_i   = np.clip(ei[:, None] + offsets[None, :], 0, n - 1)
 
-    fut_h  = h[abs_i]; fut_l = l[abs_i]; fut_c = c[abs_i]
+    fut_h = h[abs_i]; fut_l = l[abs_i]; fut_c = c[abs_i]
 
-    off_mask = offsets[None, :] < max_cap
+    off_mask = offsets[None, :] < hold_caps[:, None]
 
+    # SL: long hit when price low touches sl; short when high touches sl
     sl_hit = np.where(d[:, None] == 1,
                       fut_l <= sl_p[:, None],
                       fut_h >= sl_p[:, None]) & off_mask
+    # TP: long hit when high reaches tp; short when low reaches tp
     tp_hit = np.where(d[:, None] == 1,
                       fut_h >= tp_p[:, None],
                       fut_l <= tp_p[:, None]) & off_mask
@@ -519,7 +488,7 @@ def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
     any_exit = sl_hit | tp_hit
     first    = np.argmax(any_exit, axis=1)
     hit      = any_exit[np.arange(nt), first]
-    exit_off = np.where(hit, first, max_cap - 1)
+    exit_off = np.where(hit, first, hold_caps - 1)
 
     at_sl  = sl_hit[np.arange(nt), exit_off]
     at_tp  = tp_hit[np.arange(nt), exit_off]
@@ -536,21 +505,19 @@ def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
     trades = []
     for k in range(nt):
         trades.append({
-            "timestamp":   str(times[ei[k]]),
-            "model_id":    model_id,
-            "direction":   "long" if d[k] == 1 else "short",
-            "entry_price": round(float(ep[k]), 6),
-            "stop_price":  round(float(sl_p[k]), 6),
-            "target_price": round(float(tp_p[k]), 6),
-            "spread_used": 0.0,
+            "timestamp":         str(times[ei[k]]),
+            "model_id":          model_id,
+            "direction":         "long" if d[k] == 1 else "short",
+            "entry_price":       round(float(ep[k]),    6),
+            "stop_price":        round(float(sl_p[k]),  6),
+            "target_price":      round(float(tp_p[k]),  6),
             "volatility_regime": str(reg[k]),
-            "result_r": round(float(result_r[k]), 4),
+            "result_r":          round(float(result_r[k]), 4),
         })
 
     if len(trades) < MIN_TRADES:
         return None, trades
 
-    # stats calculation unchanged
     rr   = result_r
     wins = rr > 0
     tt   = len(rr)
@@ -563,24 +530,26 @@ def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
 
     bal  = 10_000.0; bals = [bal]
     for r in rr:
-        bal = bal * (1 + RISK_PER_TRADE * r) if r > 0 else bal * (1 - RISK_PER_TRADE * abs(r))
+        bal = bal * (1 + RISK_PER_TRADE * r) if r > 0 \
+              else bal * (1 - RISK_PER_TRADE * abs(r))
         bals.append(bal)
     bals = np.array(bals)
-    rm_a = np.maximum.accumulate(bals)
-    dd   = rm_a - bals
-    mdd  = float(dd.max() / rm_a[np.argmax(dd)]) if len(bals) > 1 else 0.0
+    rm_  = np.maximum.accumulate(bals)
+    dd   = rm_ - bals
+    mdd  = float(dd.max() / rm_[np.argmax(dd)]) if len(bals) > 1 else 0.0
 
     t0  = pd.Timestamp(times[0]); t1 = pd.Timestamp(times[-1])
     wks = max((t1 - t0).total_seconds() / 604_800, 1.0)
 
     return {
-        "total_trades":    tt,
-        "win_rate":        round(wr,  4),
-        "expectancy_r":    round(exp, 4),
-        "profit_factor":   round(pf,  3),
-        "max_drawdown":    round(mdd, 4),
-        "trades_per_week": round(tt / wks, 2),
+        "total_trades":     tt,
+        "win_rate":         round(wr,  4),
+        "expectancy_r":     round(exp, 4),
+        "profit_factor":    round(pf,  3),
+        "max_drawdown":     round(mdd, 4),
+        "trades_per_week":  round(tt / wks, 2),
     }, trades
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GRID RUNNER
@@ -620,7 +589,6 @@ def run_model_grid(model_id, detect_fn, grid_m, base_caches):
                         base, dirs, sl_arr, tp_info,
                         model_id, rl, rm, rh)
                 except Exception as e:
-                    logger.debug(f"  combo error: {e}")
                     stats = None; trades = []
 
                 if stats is not None:
@@ -670,40 +638,39 @@ def print_top(agg, model_id, keys_m, top=10):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    connect_mt5()
+    if not MT5_AVAILABLE:
+        raise RuntimeError("MetaTrader5 package not found.")
+    if not mt5.initialize(path=TERMINAL_PATH, login=LOGIN,
+                          password=PASSWORD, server=SERVER):
+        raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
 
     logger.info("=" * 70)
     logger.info("MULTI-MODEL FX ENGINE — VECTORIZED GRID SEARCH")
-    logger.info(
-        f"M1 combos: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M1):,}  "
-        f"M2: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M2):,}  "
-        f"M3: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M3):,}"
-    )
+    logger.info(f"M1 combos: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M1):,}  "
+                f"M2: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M2):,}  "
+                f"M3: {_ncombos(GRID_GLOBAL)*_ncombos(GRID_M3):,}  (all ≤20K)")
+    logger.info("Broker time: GMT+2 fixed — session masks in broker hours")
+    logger.info("  Asia    : broker 02:00–08:00  (UTC 00:00–06:00)")
+    logger.info("  London  : broker 09:00–12:00  (UTC 07:00–10:00)")
+    logger.info("  NY      : broker 14:30–17:00  (UTC 12:30–15:00)")
     logger.info("No lookahead: signal bar i → entry open[i+1]")
+    logger.info("No spread adjustment — raw open price used for entry")
     logger.info("=" * 70)
 
-    # ── Diagnostic first — see exactly what the broker exposes ────────────
-    run_symbol_diagnostic()
-
-    # ── Fetch all data then close MT5 ─────────────────────────────────────
+    # ── Fetch & cache ──────────────────────────────────────────────────────
     base_caches = {}
     for sym in SYMBOLS:
-        logger.info(f"\n[{sym}] fetching {FETCH_BARS:,} bars...")
+        logger.info(f"\n[{sym}] fetching...")
         df = fetch(sym)
-        if df is None:
-            logger.warning(f"[{sym}] skipped — see diagnostic output above")
-            continue
-        logger.info(f"[{sym}] building cache...")
-        base_caches[sym] = build_base_cache(df)
+        if df is not None:
+            logger.info(f"[{sym}] building cache...")
+            base_caches[sym] = build_base_cache(df)
 
     mt5.shutdown()
-    logger.info("\nMT5 connection closed")
-
     if not base_caches:
-        logger.error("No data fetched — aborting. Check diagnostic output in log.")
-        return
+        logger.error("No data fetched. Aborting."); return
 
-    # ── Run models ─────────────────────────────────────────────────────────
+    # ── Model loop ─────────────────────────────────────────────────────────
     model_defs = [
         (1, detect_m1, GRID_M1, list(GRID_M1.keys())),
         (2, detect_m2, GRID_M2, list(GRID_M2.keys())),
@@ -712,41 +679,42 @@ def main():
 
     for model_id, detect_fn, grid_m, keys_m in model_defs:
         logger.info(f"\n{'='*60}")
-        logger.info(f"RUNNING MODEL {model_id}")
-
+        logger.info(f"RUNNING MODEL {model_id} — {len(base_caches)} symbols")
         rows, trades = run_model_grid(model_id, detect_fn, grid_m, base_caches)
 
         if not rows:
-            logger.warning(f"Model {model_id}: no valid parameter combinations")
+            logger.warning(f"  Model {model_id}: zero valid combos — "
+                           f"consider loosening thresholds")
             continue
 
         df_full = pd.DataFrame(rows)
         df_full.to_csv(f"mme_m{model_id}_grid.csv", index=False)
 
         if trades:
-            pd.DataFrame(trades).to_csv(f"mme_m{model_id}_trades.csv", index=False)
+            pd.DataFrame(trades).to_csv(
+                f"mme_m{model_id}_trades.csv", index=False)
+            logger.info(f"  {len(trades):,} trades → mme_m{model_id}_trades.csv")
 
         agg_keys = list(GRID_GLOBAL.keys()) + keys_m
-        agg = (df_full
-               .groupby(agg_keys)
-               .agg(
-                   symbols_valid   = ("symbol",          "count"),
-                   win_rate        = ("win_rate",         "mean"),
-                   expectancy_r    = ("expectancy_r",     "mean"),
-                   profit_factor   = ("profit_factor",    "mean"),
-                   max_drawdown    = ("max_drawdown",     "mean"),
-                   trades_per_week = ("trades_per_week",  "mean"),
-               )
-               .reset_index())
+        agg = df_full.groupby(agg_keys).agg(
+            symbols_valid   = ("symbol",          "count"),
+            win_rate        = ("win_rate",         "mean"),
+            expectancy_r    = ("expectancy_r",     "mean"),
+            profit_factor   = ("profit_factor",    "mean"),
+            max_drawdown    = ("max_drawdown",     "mean"),
+            trades_per_week = ("trades_per_week",  "mean"),
+        ).reset_index()
 
         agg = agg[agg["symbols_valid"] == len(base_caches)]
         agg = agg.sort_values("expectancy_r", ascending=False).reset_index(drop=True)
         agg.to_csv(f"mme_m{model_id}_agg.csv", index=False)
+        logger.info(f"  Grid agg → mme_m{model_id}_agg.csv  "
+                    f"({len(agg)} valid combos across all symbols)")
 
         print_top(agg, model_id, keys_m)
 
-    logger.info("\n" + "=" * 70)
-    logger.info("COMPLETE")
+    logger.info(f"\n{'='*70}")
+    logger.info("COMPLETE. Best params per model in mme_m1/m2/m3_agg.csv")
     logger.info("=" * 70)
 
 
