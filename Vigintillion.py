@@ -138,32 +138,26 @@ class Bar:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def connect_mt5():
+
     if not MT5_AVAILABLE:
         raise RuntimeError("MetaTrader5 package not installed")
 
     logger.info("Initializing MT5 terminal...")
 
-    ok = mt5.initialize(
-        path=TERMINAL_PATH,
-        login=LOGIN,
-        password=PASSWORD,
-        server=SERVER,
-        timeout=60_000,
-        portable=False,
-    )
+    ok = mt5.initialize(path=TERMINAL_PATH)
+
     if not ok:
         err = mt5.last_error()
-        mt5.shutdown()
         raise RuntimeError(f"mt5.initialize failed: {err}")
 
     info = mt5.account_info()
+
     if info is None:
-        mt5.shutdown()
         raise RuntimeError(f"account_info returned None: {mt5.last_error()}")
 
-    logger.info(f"MT5 connected | Account {info.login} | Server {info.server} | Balance {info.balance}")
-
-
+    logger.info(
+        f"MT5 connected | Account {info.login} | Server {info.server} | Balance {info.balance}"
+    )
 # ══════════════════════════════════════════════════════════════════════════════
 #  SYMBOL DIAGNOSTIC — run before any fetch so failures are fully visible
 #  Pattern copied directly from Centillion's run_live() startup block
