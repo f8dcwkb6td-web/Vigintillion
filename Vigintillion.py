@@ -681,8 +681,12 @@ def main():
     if not MT5_AVAILABLE:
         raise RuntimeError("MetaTrader5 package not found.")
     mt5.shutdown()
-    if not mt5.initialize(login=LOGIN,
-                          password=PASSWORD, server=SERVER):
+    if not mt5.initialize(
+            path=TERMINAL_PATH,
+            login=LOGIN,
+            password=PASSWORD,
+            server=SERVER
+    ):
         raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
 
     logger.info("=" * 70)
