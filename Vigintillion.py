@@ -199,82 +199,18 @@ def run_symbol_diagnostic():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch(sym, n=FETCH_BARS):
-
     rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, int(n) + 1)
-
-    if rates is None:
-        err  = mt5.last_error()
-        info = mt5.symbol_info(sym)
-
-        if info is None:
-            all_syms = mt5.symbols_get()
-            candidates = (
-                [s.name for s in all_syms if sym[:3] in s.name or sym[3:] in s.name]
-                if all_syms else []
-            )
-            logger.warning(
-                f"[{sym}] fetch failed — "
-                f"error=({err[0]}, '{err[1]}') | "
-                f"symbol_info=None | "
-                f"possible names: {candidates[:10]}"
-            )
-        else:
-            tick = mt5.symbol_info_tick(sym)
-            logger.warning(
-                f"[{sym}] fetch failed — "
-                f"error=({err[0]}, '{err[1]}') | "
-                f"visible={info.visible} "
-                f"trade_mode={info.trade_mode} "
-                f"spread={info.spread} "
-                f"digits={info.digits} "
-                f"tick={'OK' if tick else 'None'} "
-                f"path={info.path}"
-            )
-
+    if rates is None or len(rates) < 10:
+        logger.warning(f"[{sym}] fetch failed or too few bars — last error: {mt5.last_error()}")
         return None
-
-    if len(rates) < 2000:
-        logger.warning(f"[{sym}] only {len(rates)} bars returned — skipping")
-        return None
-
     df = pd.DataFrame(rates)
-
-    # remove current forming bar
-    df = df.iloc[:-1]
-
-    # ── Broker time → UTC
-    df["time"] = pd.to_datetime(df["time"], unit="s")
-
-    try:
-        broker_aware = df["time"].dt.tz_localize(
-            "Europe/Athens",
-            ambiguous="infer",
-            nonexistent="shift_forward"
-        )
-        utc_ts = broker_aware.dt.tz_convert("UTC").dt.tz_localize(None)
-    except Exception:
-        logger.warning(f"[{sym}] DST conversion failed — fallback UTC-2")
-        utc_ts = df["time"] - pd.Timedelta(hours=2)
-
-    df["time"] = utc_ts
+    df = df.iloc[:-1]  # drop forming bar
+    df["time"] = pd.to_datetime(df["time"], unit="s")  # keep broker time
     df["h_utc"] = df["time"].dt.hour
     df["m_utc"] = df["time"].dt.minute
     df["date"] = df["time"].dt.date
     df["min_of_day"] = df["h_utc"] * 60 + df["m_utc"]
-
-    if "spread" in df.columns:
-        info = mt5.symbol_info(sym)
-        point = info.point if (info and info.point > 0) else 0.0001
-        df["spread_price"] = df["spread"].astype(float) * point
-    else:
-        df["spread_price"] = np.nan
-
-    logger.info(
-        f"  [{sym}] {len(df):,} bars "
-        f"{df['time'].iloc[0].date()} → {df['time'].iloc[-1].date()} "
-        f"spread={'col' if 'spread' in df.columns else 'fixed'}"
-    )
-
+    df["spread_price"] = 0.0  # remove spread entirely
     return df.reset_index(drop=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -532,11 +468,11 @@ def detect_m3(base, regime_low, eff, eff_thr, pm):
 #  VECTORIZED BACKTEST
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
                  regime_low, regime_med, regime_high):
     n     = base["n"]
     o     = base["o"]; h = base["h"]; l = base["l"]; c = base["c"]
-    sp    = base["sp"]
     times = base["times"]
 
     sig_idx = np.where(dirs != 0)[0]
@@ -547,12 +483,9 @@ def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
     ei  = sig_idx + 1
     d   = dirs[sig_idx]
 
-    sp_e = np.where(np.isnan(sp[ei]), FIXED_SPREAD, sp[ei])
-    ep   = np.where(d == 1,
-                    o[ei] + sp_e / 2.0,
-                    o[ei] - sp_e / 2.0)
+    ep = o[ei]  # simply entry at next open, no spread
 
-    sl_p    = sl_arr[sig_idx]
+    sl_p = sl_arr[sig_idx]
     sl_dist = np.maximum(np.abs(ep - sl_p), 1e-9)
 
     tp_type = tp_info[0]
@@ -566,22 +499,22 @@ def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
         br   = tp_info[1][sig_idx]; mult = tp_info[2]
         tp_p = np.where(d == 1, ep + br * mult, ep - br * mult)
 
+    # rest of logic unchanged, remove all sp_fwd references
     nt      = len(sig_idx)
     max_cap = MAX_HOLD_BARS
     offsets = np.arange(max_cap)
     abs_i   = np.clip(ei[:, None] + offsets[None, :], 0, n - 1)
 
     fut_h  = h[abs_i]; fut_l = l[abs_i]; fut_c = c[abs_i]
-    sp_fwd = np.where(np.isnan(sp[abs_i]), FIXED_SPREAD, sp[abs_i])
 
     off_mask = offsets[None, :] < max_cap
 
     sl_hit = np.where(d[:, None] == 1,
                       fut_l <= sl_p[:, None],
-                      fut_h + sp_fwd >= sl_p[:, None]) & off_mask
+                      fut_h >= sl_p[:, None]) & off_mask
     tp_hit = np.where(d[:, None] == 1,
                       fut_h >= tp_p[:, None],
-                      fut_l + sp_fwd <= tp_p[:, None]) & off_mask
+                      fut_l <= tp_p[:, None]) & off_mask
 
     any_exit = sl_hit | tp_hit
     first    = np.argmax(any_exit, axis=1)
@@ -603,20 +536,21 @@ def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
     trades = []
     for k in range(nt):
         trades.append({
-            "timestamp":         str(times[ei[k]]),
-            "model_id":          model_id,
-            "direction":         "long" if d[k] == 1 else "short",
-            "entry_price":       round(float(ep[k]),    6),
-            "stop_price":        round(float(sl_p[k]),  6),
-            "target_price":      round(float(tp_p[k]),  6),
-            "spread_used":       round(float(sp_e[k]),  6),
+            "timestamp":   str(times[ei[k]]),
+            "model_id":    model_id,
+            "direction":   "long" if d[k] == 1 else "short",
+            "entry_price": round(float(ep[k]), 6),
+            "stop_price":  round(float(sl_p[k]), 6),
+            "target_price": round(float(tp_p[k]), 6),
+            "spread_used": 0.0,
             "volatility_regime": str(reg[k]),
-            "result_r":          round(float(result_r[k]), 4),
+            "result_r": round(float(result_r[k]), 4),
         })
 
     if len(trades) < MIN_TRADES:
         return None, trades
 
+    # stats calculation unchanged
     rr   = result_r
     wins = rr > 0
     tt   = len(rr)
@@ -629,8 +563,7 @@ def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
 
     bal  = 10_000.0; bals = [bal]
     for r in rr:
-        bal = bal * (1 + RISK_PER_TRADE * r) if r > 0 \
-              else bal * (1 - RISK_PER_TRADE * abs(r))
+        bal = bal * (1 + RISK_PER_TRADE * r) if r > 0 else bal * (1 - RISK_PER_TRADE * abs(r))
         bals.append(bal)
     bals = np.array(bals)
     rm_a = np.maximum.accumulate(bals)
@@ -648,7 +581,6 @@ def backtest_vec(base, dirs, sl_arr, tp_info, model_id,
         "max_drawdown":    round(mdd, 4),
         "trades_per_week": round(tt / wks, 2),
     }, trades
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GRID RUNNER
